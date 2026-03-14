@@ -438,10 +438,11 @@ unsafe fn create_opengl_view(screen_rect: NSRect, _sample_count: i32, high_dpi: 
         msg_send_![glk_view_obj, setContentScaleFactor: 1.0];
     }
 
-    let view_ctrl_obj: ObjcId = msg_send![class!(UIViewController), alloc];
+    let view_ctrl_obj: ObjcId = msg_send![define_glk_view_controller(), alloc];
     let view_ctrl_obj: ObjcId = msg_send![view_ctrl_obj, init];
 
     msg_send_![view_ctrl_obj, setView: glk_view_obj];
+    msg_send_![view_ctrl_obj, setPreferredFramesPerSecond: 120];
 
     View {
         view: glk_view_obj,
@@ -458,7 +459,7 @@ unsafe fn create_metal_view(screen_rect: NSRect, _sample_count: i32, _high_dpi: 
     let mtk_view_dlg_obj: ObjcId = msg_send![define_glk_or_mtk_view_dlg(class!(NSObject)), alloc];
     let mtk_view_dlg_obj: ObjcId = msg_send![mtk_view_dlg_obj, init];
 
-    let view_ctrl_obj: ObjcId = msg_send![class!(UIViewController), alloc];
+    let view_ctrl_obj: ObjcId = msg_send![define_view_controller(), alloc];
     let view_ctrl_obj: ObjcId = msg_send![view_ctrl_obj, init];
 
     msg_send_![view_ctrl_obj, setView: mtk_view_obj];
@@ -486,6 +487,99 @@ impl crate::native::Clipboard for IosClipboard {
         None
     }
     fn set(&mut self, _data: &str) {}
+}
+
+fn define_view_controller() -> *const Class {
+    let superclass = class!(UIViewController);
+    let mut decl = ClassDecl::new("QuadViewController", superclass).unwrap();
+
+    extern "C" fn prefers_status_bar_hidden(_: &Object, _: Sel) -> BOOL {
+        YES
+    }
+
+    extern "C" fn prefers_home_indicator_auto_hidden(_: &Object, _: Sel) -> BOOL {
+        YES
+    }
+
+    extern "C" fn should_autorotate(_: &Object, _: Sel) -> BOOL {
+        YES
+    }
+
+    extern "C" fn supported_interface_orientations(_: &Object, _: Sel) -> u64 {
+        0x0000_0006
+    }
+
+    unsafe {
+        decl.add_method(
+            sel!(prefersStatusBarHidden),
+            prefers_status_bar_hidden as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        decl.add_method(
+            sel!(prefersHomeIndicatorAutoHidden),
+            prefers_home_indicator_auto_hidden as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        decl.add_method(
+            sel!(shouldAutorotate),
+            should_autorotate as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        decl.add_method(
+            sel!(supportedInterfaceOrientations),
+            supported_interface_orientations as extern "C" fn(&Object, Sel) -> u64,
+        );
+    }
+
+    decl.register()
+}
+
+fn define_glk_view_controller() -> *const Class {
+    let superclass = class!(GLKViewController);
+    let mut decl = ClassDecl::new("QuadGLKViewController", superclass).unwrap();
+
+    extern "C" fn prefers_status_bar_hidden(_: &Object, _: Sel) -> BOOL {
+        YES
+    }
+
+    extern "C" fn prefers_home_indicator_auto_hidden(_: &Object, _: Sel) -> BOOL {
+        YES
+    }
+
+    extern "C" fn should_autorotate(_: &Object, _: Sel) -> BOOL {
+        YES
+    }
+
+    extern "C" fn supported_interface_orientations(_: &Object, _: Sel) -> u64 {
+        0x0000_0006
+    }
+
+    extern "C" fn preferred_screen_edges_deferring_system_gestures(_: &Object, _: Sel) -> i32 {
+        15
+    }
+
+    unsafe {
+        decl.add_method(
+            sel!(prefersStatusBarHidden),
+            prefers_status_bar_hidden as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        decl.add_method(
+            sel!(prefersHomeIndicatorAutoHidden),
+            prefers_home_indicator_auto_hidden as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        decl.add_method(
+            sel!(shouldAutorotate),
+            should_autorotate as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        decl.add_method(
+            sel!(supportedInterfaceOrientations),
+            supported_interface_orientations as extern "C" fn(&Object, Sel) -> u64,
+        );
+        decl.add_method(
+            sel!(preferredScreenEdgesDeferringSystemGestures),
+            preferred_screen_edges_deferring_system_gestures
+                as extern "C" fn(&Object, Sel) -> i32,
+        );
+    }
+
+    decl.register()
 }
 
 pub fn define_app_delegate() -> *const Class {
@@ -603,11 +697,9 @@ pub fn define_app_delegate() -> *const Class {
             (*view.view_dlg).set_ivar("display_ptr", payload_ptr);
             (*textfield_dlg).set_ivar("display_ptr", payload_ptr);
 
-            msg_send_![window_obj, addSubview: view.view];
-
             msg_send_![window_obj, setRootViewController: view.view_ctrl];
-
             msg_send_![window_obj, makeKeyAndVisible];
+            msg_send_![view.view_ctrl, setNeedsStatusBarAppearanceUpdate];
 
             struct SendHack<F>(F);
             unsafe impl<F> Send for SendHack<F> {}
