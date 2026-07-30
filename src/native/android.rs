@@ -205,11 +205,16 @@ impl MainThreadState {
                 y,
             } => {
                 if phase == TouchPhase::Started {
-                    crate::native_display()
-                        .lock()
-                        .unwrap()
-                        .touch_start_times
-                        .insert(touch_id, time);
+                    let mut display = crate::native_display().lock().unwrap();
+                    display.touch_start_times.insert(touch_id, time);
+                    display
+                        .pending_touch_starts
+                        .push(crate::window::TouchStart {
+                            id: touch_id,
+                            time,
+                            x,
+                            y,
+                        });
                 }
                 self.event_handler.touch_event(phase, touch_id, x, y);
                 if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
@@ -277,6 +282,11 @@ impl MainThreadState {
                 (self.libegl.eglSwapBuffers)(self.egl_display, self.surface);
             }
         }
+        crate::native_display()
+            .lock()
+            .unwrap()
+            .pending_touch_starts
+            .clear();
     }
 
     fn process_request(&mut self, request: crate::native::Request) {

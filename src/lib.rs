@@ -117,6 +117,14 @@ fn native_display() -> &'static Mutex<native::NativeDisplayData> {
 /// Window and associated to window rendering context related functions.
 /// in macroquad <= 0.3, it was ctx.screen_size(). Now it is window::screen_size()
 pub mod window {
+    #[derive(Clone, Copy, Debug)]
+    pub struct TouchStart {
+        pub id: u64,
+        pub time: f64,
+        pub x: f32,
+        pub y: f32,
+    }
+
     use super::*;
 
     /// The same as
@@ -156,6 +164,10 @@ pub mod window {
             .touch_start_times
             .get(&id)
             .copied()
+    }
+
+    pub fn take_touch_starts() -> Vec<TouchStart> {
+        std::mem::take(&mut native_display().lock().unwrap().pending_touch_starts)
     }
 
     /// Monotonically increasing generation for iOS application resumes.

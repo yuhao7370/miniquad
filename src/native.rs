@@ -24,6 +24,7 @@ pub(crate) struct NativeDisplayData {
     pub clipboard: Box<dyn Clipboard>,
     pub dropped_files: DroppedFiles,
     pub touch_start_times: HashMap<u64, f64>,
+    pub pending_touch_starts: Vec<crate::window::TouchStart>,
     pub blocking_event_loop: bool,
     #[cfg(target_os = "ios")]
     pub ios_resume_generation: u64,
@@ -60,6 +61,7 @@ impl NativeDisplayData {
             clipboard,
             dropped_files: Default::default(),
             touch_start_times: Default::default(),
+            pending_touch_starts: Default::default(),
             blocking_event_loop: false,
             #[cfg(target_os = "ios")]
             ios_resume_generation: 0,
