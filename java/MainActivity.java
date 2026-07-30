@@ -88,8 +88,14 @@ class QuadSurface
     public boolean onTouch(View v, MotionEvent event) {
         int pointerCount = event.getPointerCount();
         int action = event.getActionMasked();
+        final long eventUptimeNanos;
+        if (Build.VERSION.SDK_INT >= 34) {
+            eventUptimeNanos = event.getEventTimeNanos();
+        } else {
+            eventUptimeNanos = event.getEventTime() * 1_000_000L;
+        }
         final double touchTime = (System.currentTimeMillis() +
-            (event.getEventTimeNanos() - SystemClock.elapsedRealtimeNanos()) / 1_000_000.0) / 1000.0;
+            eventUptimeNanos / 1_000_000.0 - SystemClock.uptimeMillis()) / 1000.0;
 
         switch(action) {
         case MotionEvent.ACTION_MOVE: {
