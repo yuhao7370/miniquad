@@ -209,10 +209,6 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                 state.paused = true;
             }
             Message::Resume => {
-                let mut display = native_display().lock().unwrap();
-                display.ios_resume_generation = display.ios_resume_generation.wrapping_add(1);
-                drop(display);
-
                 let mut state = payload.state.lock().unwrap();
                 state.paused = false;
             }
@@ -804,6 +800,10 @@ pub fn define_app_delegate() -> *const Class {
     }
 
     extern "C" fn application_did_become_active(_: &Object, _: Sel, _: ObjcId) {
+        let mut display = native_display().lock().unwrap();
+        display.ios_resume_generation = display.ios_resume_generation.wrapping_add(1);
+        drop(display);
+
         send_message(Message::Resume);
     }
 
