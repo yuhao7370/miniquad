@@ -53,6 +53,7 @@ enum Message {
     Touch {
         phase: TouchPhase,
         touch_id: u64,
+        time: f64,
         x: f32,
         y: f32,
     },
@@ -199,10 +200,25 @@ impl MainThreadState {
             Message::Touch {
                 phase,
                 touch_id,
+                time,
                 x,
                 y,
             } => {
+                if phase == TouchPhase::Started {
+                    crate::native_display()
+                        .lock()
+                        .unwrap()
+                        .touch_start_times
+                        .insert(touch_id, time);
+                }
                 self.event_handler.touch_event(phase, touch_id, x, y);
+                if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                    crate::native_display()
+                        .lock()
+                        .unwrap()
+                        .touch_start_times
+                        .remove(&touch_id);
+                }
             }
             Message::Character { character } => {
                 if let Some(character) = char::from_u32(character) {
@@ -623,6 +639,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnTouch(
     _: ndk_sys::jobject,
     touch_id: ndk_sys::jint,
     action: ndk_sys::jint,
+    time: ndk_sys::jdouble,
     x: ndk_sys::jfloat,
     y: ndk_sys::jfloat,
 ) {
@@ -637,6 +654,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnTouch(
     send_message(Message::Touch {
         phase,
         touch_id: touch_id as _,
+        time: time as _,
         x: x as f32,
         y: y as f32,
     });

@@ -88,6 +88,7 @@ enum Message {
     Touch {
         phase: TouchPhase,
         touch_id: u64,
+        time: f64,
         x: f32,
         y: f32,
     },
@@ -144,11 +145,15 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
             let enumerator: ObjcId = msg_send![event, allTouches];
             let size: u64 = msg_send![enumerator, count];
             let enumerator: ObjcId = msg_send![enumerator, objectEnumerator];
+            let process_info: ObjcId = msg_send![class!(NSProcessInfo), processInfo];
+            let system_uptime: f64 = msg_send![process_info, systemUptime];
+            let wall_time: f64 = msg_send![class!(NSDate), timeIntervalSince1970];
 
             for _ in 0..size {
                 let ios_touch: ObjcId = msg_send![enumerator, nextObject];
                 // Use the UITouch pointer as a stable ID instead of loop index
                 let touch_id = ios_touch as u64;
+                let touch_timestamp: f64 = msg_send![ios_touch, timestamp];
                 let mut ios_pos: NSPoint = msg_send![ios_touch, locationInView: this];
 
                 if native_display().lock().unwrap().high_dpi {
@@ -166,6 +171,7 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                 send_message(Message::Touch {
                     phase,
                     touch_id,
+                    time: wall_time - (system_uptime - touch_timestamp),
                     x: ios_pos.x as f32,
                     y: ios_pos.y as f32,
                 });
@@ -213,11 +219,26 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
             Message::Touch {
                 phase,
                 touch_id,
+                time,
                 x,
                 y,
             } => {
+                if phase == TouchPhase::Started {
+                    native_display()
+                        .lock()
+                        .unwrap()
+                        .touch_start_times
+                        .insert(touch_id, time);
+                }
                 if let Some(ref mut event_handler) = payload.event_handler {
                     event_handler.touch_event(phase, touch_id, x, y);
+                }
+                if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                    native_display()
+                        .lock()
+                        .unwrap()
+                        .touch_start_times
+                        .remove(&touch_id);
                 }
             }
             Message::Character { character } => {

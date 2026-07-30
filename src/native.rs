@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 #[cfg(not(target_os = "android"))]
 use std::sync::mpsc;
 
@@ -22,6 +23,7 @@ pub(crate) struct NativeDisplayData {
     pub native_requests: mpsc::Sender<Request>,
     pub clipboard: Box<dyn Clipboard>,
     pub dropped_files: DroppedFiles,
+    pub touch_start_times: HashMap<u64, f64>,
     pub blocking_event_loop: bool,
 
     #[cfg(target_vendor = "apple")]
@@ -55,6 +57,7 @@ impl NativeDisplayData {
             native_requests,
             clipboard,
             dropped_files: Default::default(),
+            touch_start_times: Default::default(),
             blocking_event_loop: false,
             #[cfg(target_vendor = "apple")]
             gfx_api: crate::conf::AppleGfxApi::OpenGl,
