@@ -158,6 +158,12 @@ pub mod window {
             .copied()
     }
 
+    /// Monotonically increasing generation for iOS application resumes.
+    #[cfg(target_os = "ios")]
+    pub fn ios_resume_generation() -> u64 {
+        native_display().lock().unwrap().ios_resume_generation
+    }
+
     /// The dpi scaling factor (window pixels to framebuffer pixels)
     /// NOTE: [High DPI Rendering](../conf/index.html#high-dpi-rendering)
     pub fn dpi_scale() -> f32 {
