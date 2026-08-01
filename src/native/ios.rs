@@ -302,7 +302,7 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
             touches_ended as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
         );
         decl.add_method(
-            sel!(touchesCanceled: withEvent:),
+            sel!(touchesCancelled: withEvent:),
             touches_canceled as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
         );
         decl.add_method(
@@ -502,6 +502,7 @@ unsafe fn create_metal_view(screen_rect: NSRect, _sample_count: i32, _high_dpi: 
     let device = MTLCreateSystemDefaultDevice();
     msg_send_![mtk_view_obj, setDevice: device];
     msg_send_![mtk_view_obj, setUserInteractionEnabled: YES];
+    msg_send_![mtk_view_obj, setMultipleTouchEnabled: YES];
 
     View {
         view: mtk_view_obj,
