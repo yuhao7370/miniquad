@@ -204,17 +204,28 @@ impl MainThreadState {
                 x,
                 y,
             } => {
-                if phase == TouchPhase::Started {
+                {
                     let mut display = crate::native_display().lock().unwrap();
-                    display.touch_start_times.insert(touch_id, time);
                     display
-                        .pending_touch_starts
-                        .push(crate::window::TouchStart {
+                        .pending_touch_events
+                        .push(crate::window::TouchEvent {
+                            phase,
                             id: touch_id,
                             time,
                             x,
                             y,
                         });
+                    if phase == TouchPhase::Started {
+                        display.touch_start_times.insert(touch_id, time);
+                        display
+                            .pending_touch_starts
+                            .push(crate::window::TouchStart {
+                                id: touch_id,
+                                time,
+                                x,
+                                y,
+                            });
+                    }
                 }
                 self.event_handler.touch_event(phase, touch_id, x, y);
                 if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
@@ -282,11 +293,9 @@ impl MainThreadState {
                 (self.libegl.eglSwapBuffers)(self.egl_display, self.surface);
             }
         }
-        crate::native_display()
-            .lock()
-            .unwrap()
-            .pending_touch_starts
-            .clear();
+        let mut display = crate::native_display().lock().unwrap();
+        display.pending_touch_starts.clear();
+        display.pending_touch_events.clear();
     }
 
     fn process_request(&mut self, request: crate::native::Request) {

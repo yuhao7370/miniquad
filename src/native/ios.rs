@@ -223,17 +223,28 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                 x,
                 y,
             } => {
-                if phase == TouchPhase::Started {
+                {
                     let mut display = native_display().lock().unwrap();
-                    display.touch_start_times.insert(touch_id, time);
                     display
-                        .pending_touch_starts
-                        .push(crate::window::TouchStart {
+                        .pending_touch_events
+                        .push(crate::window::TouchEvent {
+                            phase,
                             id: touch_id,
                             time,
                             x,
                             y,
                         });
+                    if phase == TouchPhase::Started {
+                        display.touch_start_times.insert(touch_id, time);
+                        display
+                            .pending_touch_starts
+                            .push(crate::window::TouchStart {
+                                id: touch_id,
+                                time,
+                                x,
+                                y,
+                            });
+                    }
                 }
                 if let Some(ref mut event_handler) = payload.event_handler {
                     event_handler.touch_event(phase, touch_id, x, y);
@@ -388,11 +399,10 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
         if let Some(ref mut event_handler) = payload.event_handler {
             event_handler.update();
             event_handler.draw();
-            native_display()
-                .lock()
-                .unwrap()
-                .pending_touch_starts
-                .clear();
+            let mut display = native_display().lock().unwrap();
+            display.pending_touch_starts.clear();
+            display.pending_touch_events.clear();
+            drop(display);
             let mut s = payload.state.lock().unwrap();
             s.update_requested = false;
         }

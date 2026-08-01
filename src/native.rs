@@ -25,6 +25,7 @@ pub(crate) struct NativeDisplayData {
     pub dropped_files: DroppedFiles,
     pub touch_start_times: HashMap<u64, f64>,
     pub pending_touch_starts: Vec<crate::window::TouchStart>,
+    pub pending_touch_events: Vec<crate::window::TouchEvent>,
     pub blocking_event_loop: bool,
     #[cfg(target_os = "ios")]
     pub ios_resume_generation: u64,
@@ -62,6 +63,7 @@ impl NativeDisplayData {
             dropped_files: Default::default(),
             touch_start_times: Default::default(),
             pending_touch_starts: Default::default(),
+            pending_touch_events: Default::default(),
             blocking_event_loop: false,
             #[cfg(target_os = "ios")]
             ios_resume_generation: 0,
