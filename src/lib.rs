@@ -165,7 +165,9 @@ pub mod window {
         (d.screen_width as f32, d.screen_height as f32)
     }
 
-    /// Returns the Unix timestamp at which the active touch began.
+    /// Returns the timestamp at which the active touch began.
+    ///
+    /// Use [`touch_time_now`] to compare it with the current time.
     pub fn touch_start_time(id: u64) -> Option<f64> {
         native_display()
             .lock()
@@ -173,6 +175,18 @@ pub mod window {
             .touch_start_times
             .get(&id)
             .copied()
+    }
+
+    /// Returns the current time in the same clock domain as touch timestamps.
+    #[cfg(target_os = "ios")]
+    pub fn touch_time_now() -> f64 {
+        crate::native::ios::touch_time_now()
+    }
+
+    /// Returns the current time in the same clock domain as touch timestamps.
+    #[cfg(not(target_os = "ios"))]
+    pub fn touch_time_now() -> f64 {
+        crate::date::now()
     }
 
     pub fn take_touch_starts() -> Vec<TouchStart> {

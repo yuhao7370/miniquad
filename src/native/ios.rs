@@ -85,13 +85,6 @@ enum Message {
         width: i32,
         height: i32,
     },
-    Touch {
-        phase: TouchPhase,
-        touch_id: u64,
-        time: f64,
-        x: f32,
-        y: f32,
-    },
     Character {
         character: u32,
     },
@@ -101,6 +94,7 @@ enum Message {
     KeyUp {
         keycode: KeyCode,
     },
+    Wake,
     Pause,
     Resume,
     Destroy,
@@ -137,6 +131,13 @@ fn send_message(message: Message) {
     })
 }
 
+pub(crate) fn touch_time_now() -> f64 {
+    unsafe {
+        let process_info: ObjcId = msg_send![class!(NSProcessInfo), processInfo];
+        msg_send![process_info, systemUptime]
+    }
+}
+
 pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
     let mut decl = ClassDecl::new("QuadView", superclass).unwrap();
 
@@ -144,10 +145,10 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         unsafe {
             let size: u64 = msg_send![touches, count];
             let enumerator: ObjcId = msg_send![touches, objectEnumerator];
-            let process_info: ObjcId = msg_send![class!(NSProcessInfo), processInfo];
-            let system_uptime: f64 = msg_send![process_info, systemUptime];
-            let now: ObjcId = msg_send![class!(NSDate), date];
-            let wall_time: f64 = msg_send![now, timeIntervalSince1970];
+            let payload = get_window_payload(this);
+            if payload.event_handler.is_none() {
+                payload.init_event_handler();
+            }
 
             for _ in 0..size {
                 let ios_touch: ObjcId = msg_send![enumerator, nextObject];
@@ -168,13 +169,45 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                     ios_pos.y *= content_scale_factor;
                 }
 
-                send_message(Message::Touch {
-                    phase,
-                    touch_id,
-                    time: wall_time - (system_uptime - touch_timestamp),
-                    x: ios_pos.x as f32,
-                    y: ios_pos.y as f32,
-                });
+                let x = ios_pos.x as f32;
+                let y = ios_pos.y as f32;
+                {
+                    let mut display = native_display().lock().unwrap();
+                    display
+                        .pending_touch_events
+                        .push(crate::window::TouchEvent {
+                            phase,
+                            id: touch_id,
+                            time: touch_timestamp,
+                            x,
+                            y,
+                        });
+                    if phase == TouchPhase::Started {
+                        display.touch_start_times.insert(touch_id, touch_timestamp);
+                        display
+                            .pending_touch_starts
+                            .push(crate::window::TouchStart {
+                                id: touch_id,
+                                time: touch_timestamp,
+                                x,
+                                y,
+                            });
+                    }
+                }
+                if let Some(ref mut event_handler) = payload.event_handler {
+                    event_handler.touch_event(phase, touch_id, x, y);
+                }
+                if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                    native_display()
+                        .lock()
+                        .unwrap()
+                        .touch_start_times
+                        .remove(&touch_id);
+                }
+            }
+            let blocking_event_loop = native_display().lock().unwrap().blocking_event_loop;
+            if blocking_event_loop {
+                send_message(Message::Wake);
             }
         }
     }
@@ -216,47 +249,7 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                 let mut state = payload.state.lock().unwrap();
                 state.quit = true;
             }
-            Message::Touch {
-                phase,
-                touch_id,
-                time,
-                x,
-                y,
-            } => {
-                {
-                    let mut display = native_display().lock().unwrap();
-                    display
-                        .pending_touch_events
-                        .push(crate::window::TouchEvent {
-                            phase,
-                            id: touch_id,
-                            time,
-                            x,
-                            y,
-                        });
-                    if phase == TouchPhase::Started {
-                        display.touch_start_times.insert(touch_id, time);
-                        display
-                            .pending_touch_starts
-                            .push(crate::window::TouchStart {
-                                id: touch_id,
-                                time,
-                                x,
-                                y,
-                            });
-                    }
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.touch_event(phase, touch_id, x, y);
-                }
-                if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
-                    native_display()
-                        .lock()
-                        .unwrap()
-                        .touch_start_times
-                        .remove(&touch_id);
-                }
-            }
+            Message::Wake => {}
             Message::Character { character } => {
                 if let Some(character) = char::from_u32(character) {
                     if let Some(ref mut event_handler) = payload.event_handler {
