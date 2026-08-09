@@ -4,6 +4,7 @@ use crate::{
     conf::{Conf, Icon},
     event::{KeyMods, MouseButton},
     native::{NativeDisplayData, Request},
+    window::{self, ImeEvent},
     CursorIcon, EventHandler,
 };
 
@@ -27,6 +28,8 @@ use winapi::{
 
 // IME constants
 const GCS_RESULTSTR: DWORD = 0x0800;
+const GCS_COMPSTR: DWORD = 0x0008;
+const GCS_CURSORPOS: DWORD = 0x0080;
 
 // IME message constants
 const WM_IME_SETCONTEXT: UINT = 0x0281;
@@ -84,6 +87,38 @@ extern "system" {
     fn ImmSetCandidateWindow(himc: HIMC, lpCandidate: *const CANDIDATEFORM) -> i32;
     fn ImmGetOpenStatus(himc: HIMC) -> i32;
     fn ImmSetOpenStatus(himc: HIMC, fOpen: i32) -> i32;
+}
+
+unsafe fn composition_utf16(himc: HIMC, index: DWORD) -> Vec<u16> {
+    let byte_len = ImmGetCompositionStringW(himc, index, std::ptr::null_mut(), 0);
+    if byte_len <= 0 {
+        return Vec::new();
+    }
+
+    let mut buffer = vec![0; byte_len as usize / 2];
+    let actual_len = ImmGetCompositionStringW(
+        himc,
+        index,
+        buffer.as_mut_ptr().cast(),
+        byte_len as DWORD,
+    );
+    if actual_len <= 0 {
+        return Vec::new();
+    }
+    buffer.truncate(actual_len as usize / 2);
+    buffer
+}
+
+fn utf16_cursor_to_utf8(units: &[u16], cursor: usize) -> usize {
+    let mut cursor = cursor.min(units.len());
+    if cursor > 0
+        && cursor < units.len()
+        && (0xD800..=0xDBFF).contains(&units[cursor - 1])
+        && (0xDC00..=0xDFFF).contains(&units[cursor])
+    {
+        cursor -= 1;
+    }
+    String::from_utf16_lossy(&units[..cursor]).len()
 }
 
 // IME Association flags
@@ -175,6 +210,7 @@ impl WindowsDisplay {
                 // Re-associate IME context with the window
                 ImmAssociateContextEx(self.wnd, std::ptr::null_mut(), IACE_DEFAULT);
             } else {
+                window::push_ime_event(ImeEvent::End);
                 IME_USER_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 // Disassociate IME context from the window
                 ImmAssociateContextEx(self.wnd, std::ptr::null_mut(), 0);
@@ -590,39 +626,36 @@ unsafe extern "system" fn win32_wndproc(
         }
         WM_IME_COMPOSITION => {
             let flags = lparam as u32;
-            
-            // Extract and dispatch the result string manually to avoid duplicates
-            if (flags & GCS_RESULTSTR) != 0 {
-                let himc = ImmGetContext(hwnd);
-                if !himc.is_null() {
-                    let len = ImmGetCompositionStringW(himc, GCS_RESULTSTR, std::ptr::null_mut(), 0);
-                    if len > 0 {
-                        let mut buffer: Vec<u16> = vec![0; (len as usize / 2) + 1];
-                        let actual_len = ImmGetCompositionStringW(
-                            himc, 
-                            GCS_RESULTSTR, 
-                            buffer.as_mut_ptr() as *mut _, 
-                            len as u32
-                        );
-                        if actual_len > 0 {
-                            let char_count = actual_len as usize / 2;
-                            let mods = key_mods();
-                            // Send chars in order
-                            for i in 0..char_count {
-                                let chr = buffer[i];
-                                if let Some(c) = char::from_u32(chr as u32) {
-                                    event_handler.char_event(c, mods, false);
-                                }
-                            }
-                        }
+
+            let himc = ImmGetContext(hwnd);
+            if !himc.is_null() {
+                if (flags & GCS_RESULTSTR) != 0 {
+                    let result = String::from_utf16_lossy(&composition_utf16(himc, GCS_RESULTSTR));
+                    let mods = key_mods();
+                    for character in result.chars() {
+                        event_handler.char_event(character, mods, false);
                     }
-                    ImmReleaseContext(hwnd, himc);
                 }
-                return 0;
+
+                if (flags & GCS_COMPSTR) != 0 {
+                    let composition = composition_utf16(himc, GCS_COMPSTR);
+                    let cursor = ImmGetCompositionStringW(
+                        himc,
+                        GCS_CURSORPOS,
+                        std::ptr::null_mut(),
+                        0,
+                    );
+                    let text = String::from_utf16_lossy(&composition);
+                    let cursor = (cursor >= 0)
+                        .then(|| utf16_cursor_to_utf8(&composition, cursor as usize));
+                    window::push_ime_event(ImeEvent::Preedit { text, cursor });
+                } else if (flags & GCS_RESULTSTR) != 0 {
+                    window::push_ime_event(ImeEvent::End);
+                }
+
+                ImmReleaseContext(hwnd, himc);
             }
-            
-            // For non-result messages (composition state updates), pass to DefWindowProc
-            return DefWindowProcW(hwnd, umsg, wparam, lparam);
+            return 0;
         }
         WM_IME_SETCONTEXT => {
             let user_disabled = IME_USER_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
@@ -666,6 +699,7 @@ unsafe extern "system" fn win32_wndproc(
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_IME_ENDCOMPOSITION => {
+            window::push_ime_event(ImeEvent::End);
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_IME_NOTIFY => {
