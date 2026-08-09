@@ -485,6 +485,52 @@ pub mod Xlib_h {
         pub window: Window,
     }
     pub type XPointer = *mut libc::c_char;
+    pub type XIM = *mut libc::c_void;
+    pub type XIC = *mut libc::c_void;
+    pub type XIMStyle = libc::c_ulong;
+    pub type XVaNestedList = *mut libc::c_void;
+    pub type XIMProc = Option<unsafe extern "C" fn(_: XIM, _: XPointer, _: XPointer)>;
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct XIMCallback {
+        pub client_data: XPointer,
+        pub callback: XIMProc,
+    }
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub union XIMString {
+        pub multi_byte: *mut libc::c_char,
+        pub wide_char: *mut libc::wchar_t,
+    }
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct XIMText {
+        pub length: libc::c_ushort,
+        pub feedback: *mut libc::c_ulong,
+        pub encoding_is_wchar: libc::c_int,
+        pub string: XIMString,
+    }
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct XIMPreeditDrawCallbackStruct {
+        pub caret: libc::c_int,
+        pub chg_first: libc::c_int,
+        pub chg_length: libc::c_int,
+        pub text: *mut XIMText,
+    }
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct XIMPreeditCaretCallbackStruct {
+        pub position: libc::c_int,
+        pub direction: libc::c_int,
+        pub style: libc::c_int,
+    }
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct XPoint {
+        pub x: libc::c_short,
+        pub y: libc::c_short,
+    }
     pub type XErrorHandler =
         Option<unsafe extern "C" fn(_: *mut Display, _: *mut XErrorEvent) -> libc::c_int>;
     #[derive(Copy, Clone)]
@@ -799,7 +845,7 @@ pub mod Xresource_h {
         pub size: libc::c_uint,
         pub addr: XPointer,
     }
-    use super::Xlib_h::{XPointer, _XrmHashBucketRec};
+    use super::Xlib_h::{_XrmHashBucketRec, XPointer};
 }
 
 #[derive(Copy, Clone)]
@@ -884,6 +930,14 @@ crate::declare_module!(
     pub fn XSetClassHint(*mut Display, Window, *mut XClassHint),
     pub fn Xutf8SetWMProperties(*mut Display, Window, *const c_char, *const c_char, *mut *mut c_char, c_int, *mut XSizeHints, *mut XWMHints, *mut XClassHint),
     pub fn XLookupString(*mut XKeyEvent, *mut c_char, c_int, *mut KeySym, *mut XComposeStatus) -> c_int,
+    pub fn XSetLocaleModifiers(*const c_char) -> *mut c_char,
+    pub fn XOpenIM(*mut Display, XrmDatabase, *mut c_char, *mut c_char) -> XIM,
+    pub fn XCloseIM(XIM) -> c_int,
+    pub fn XDestroyIC(XIC),
+    pub fn XSetICFocus(XIC),
+    pub fn XUnsetICFocus(XIC),
+    pub fn XFilterEvent(*mut XEvent, Window) -> c_int,
+    pub fn Xutf8LookupString(XIC, *mut XKeyEvent, *mut c_char, c_int, *mut KeySym, *mut c_int) -> c_int,
     pub fn XInitThreads() -> c_int,
     pub fn XrmInitialize(),
     pub fn XOpenDisplay(*const c_char) -> *mut Display,
@@ -929,6 +983,9 @@ crate::declare_module!(
     pub fn XFreePixmap(*mut Display, Pixmap) -> c_int,
     pub fn XDefineCursor(*mut Display, Window, Cursor) -> c_int,
     ...
+    pub fn XCreateIC(XIM, ...) -> XIC,
+    pub fn XSetICValues(XIC, ...) -> *mut c_char,
+    pub fn XVaCreateNestedList(c_int, ...) -> XVaNestedList,
     ...
     pub extensions: X11Extensions,
 );
