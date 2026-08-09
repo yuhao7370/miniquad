@@ -18,11 +18,55 @@ use {
     },
     std::{
         cell::RefCell,
+        collections::VecDeque,
         os::raw::c_void,
         sync::{mpsc, Arc, Mutex},
         thread::{self},
     },
 };
+
+extern "C" {
+    static UIApplicationLaunchOptionsURLKey: ObjcId;
+}
+
+static OPENED_URLS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
+
+pub struct OpenedUrl(*mut std::ffi::c_void);
+
+impl OpenedUrl {
+    pub fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.0
+    }
+}
+
+impl Drop for OpenedUrl {
+    fn drop(&mut self) {
+        unsafe {
+            msg_send_![self.0 as ObjcId, release];
+        }
+    }
+}
+
+fn enqueue_opened_url(url: ObjcId) {
+    if url.is_null() {
+        return;
+    }
+
+    let mut opened_urls = OPENED_URLS.lock().unwrap();
+    unsafe {
+        msg_send_![url, retain];
+    }
+    opened_urls.push_back(url as usize);
+}
+
+pub fn take_opened_urls() -> Vec<OpenedUrl> {
+    OPENED_URLS
+        .lock()
+        .unwrap()
+        .drain(..)
+        .map(|url| OpenedUrl(url as *mut std::ffi::c_void))
+        .collect()
+}
 
 struct MainThreadState {
     quit: bool,
@@ -81,19 +125,10 @@ fn get_window_payload(this: &Object) -> &mut IosDisplay {
 
 #[derive(Debug, Clone, Copy)]
 enum Message {
-    Resize {
-        width: i32,
-        height: i32,
-    },
-    Character {
-        character: u32,
-    },
-    KeyDown {
-        keycode: KeyCode,
-    },
-    KeyUp {
-        keycode: KeyCode,
-    },
+    Resize { width: i32, height: i32 },
+    Character { character: u32 },
+    KeyDown { keycode: KeyCode },
+    KeyUp { keycode: KeyCode },
     Wake,
     Pause,
     Resume,
@@ -609,8 +644,7 @@ fn define_glk_view_controller() -> *const Class {
         );
         decl.add_method(
             sel!(preferredScreenEdgesDeferringSystemGestures),
-            preferred_screen_edges_deferring_system_gestures
-                as extern "C" fn(&Object, Sel) -> i32,
+            preferred_screen_edges_deferring_system_gestures as extern "C" fn(&Object, Sel) -> i32,
         );
     }
 
@@ -625,9 +659,15 @@ pub fn define_app_delegate() -> *const Class {
         _: &Object,
         _: Sel,
         _: ObjcId,
-        _: ObjcId,
+        launch_options: ObjcId,
     ) -> BOOL {
         unsafe {
+            if !launch_options.is_null() {
+                let url: ObjcId =
+                    msg_send![launch_options, objectForKey: UIApplicationLaunchOptionsURLKey];
+                enqueue_opened_url(url);
+            }
+
             let (f, conf) = RUN_ARGS.take().unwrap();
 
             let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
@@ -825,6 +865,21 @@ pub fn define_app_delegate() -> *const Class {
         send_message(Message::Pause);
     }
 
+    extern "C" fn application_open_url(
+        _: &Object,
+        _: Sel,
+        _: ObjcId,
+        url: ObjcId,
+        _: ObjcId,
+    ) -> BOOL {
+        if url.is_null() {
+            NO
+        } else {
+            enqueue_opened_url(url);
+            YES
+        }
+    }
+
     unsafe {
         decl.add_method(
             sel!(application: didFinishLaunchingWithOptions:),
@@ -838,6 +893,10 @@ pub fn define_app_delegate() -> *const Class {
         decl.add_method(
             sel!(applicationWillResignActive:),
             application_will_resign_active as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(application: openURL: options:),
+            application_open_url as extern "C" fn(&Object, Sel, ObjcId, ObjcId, ObjcId) -> BOOL,
         );
     }
     decl.register()
