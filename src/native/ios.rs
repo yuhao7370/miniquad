@@ -31,6 +31,14 @@ extern "C" {
 
 static OPENED_URLS: Mutex<VecDeque<(usize, bool)>> = Mutex::new(VecDeque::new());
 
+pub type OpenedUrlHandler = unsafe fn(*mut c_void);
+
+static OPENED_URL_HANDLER: Mutex<Option<OpenedUrlHandler>> = Mutex::new(None);
+
+pub fn set_opened_url_handler(handler: OpenedUrlHandler) {
+    *OPENED_URL_HANDLER.lock().unwrap() = Some(handler);
+}
+
 pub struct OpenedUrl {
     url: *mut std::ffi::c_void,
     access_started: bool,
@@ -63,6 +71,20 @@ fn enqueue_opened_url(url: ObjcId) {
         msg_send_![url, retain];
         let access_started: BOOL = msg_send![url, startAccessingSecurityScopedResource];
         opened_urls.push_back((url as usize, access_started != NO));
+    }
+}
+
+fn dispatch_opened_url(url: ObjcId) {
+    if url.is_null() {
+        return;
+    }
+
+    let handler = *OPENED_URL_HANDLER.lock().unwrap();
+    if let Some(handler) = handler {
+        // The application must adopt provider-owned contents before UIKit's callback returns.
+        unsafe { handler(url.cast()) };
+    } else {
+        enqueue_opened_url(url);
     }
 }
 
@@ -675,7 +697,7 @@ pub fn define_app_delegate() -> *const Class {
             if !launch_options.is_null() {
                 let url: ObjcId =
                     msg_send![launch_options, objectForKey: UIApplicationLaunchOptionsURLKey];
-                enqueue_opened_url(url);
+                dispatch_opened_url(url);
             }
 
             let (f, conf) = RUN_ARGS.take().unwrap();
@@ -885,7 +907,7 @@ pub fn define_app_delegate() -> *const Class {
         if url.is_null() {
             NO
         } else {
-            enqueue_opened_url(url);
+            dispatch_opened_url(url);
             YES
         }
     }
