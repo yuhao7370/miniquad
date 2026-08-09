@@ -29,20 +29,26 @@ extern "C" {
     static UIApplicationLaunchOptionsURLKey: ObjcId;
 }
 
-static OPENED_URLS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
+static OPENED_URLS: Mutex<VecDeque<(usize, bool)>> = Mutex::new(VecDeque::new());
 
-pub struct OpenedUrl(*mut std::ffi::c_void);
+pub struct OpenedUrl {
+    url: *mut std::ffi::c_void,
+    access_started: bool,
+}
 
 impl OpenedUrl {
     pub fn as_ptr(&self) -> *mut std::ffi::c_void {
-        self.0
+        self.url
     }
 }
 
 impl Drop for OpenedUrl {
     fn drop(&mut self) {
         unsafe {
-            msg_send_![self.0 as ObjcId, release];
+            if self.access_started {
+                msg_send_![self.url as ObjcId, stopAccessingSecurityScopedResource];
+            }
+            msg_send_![self.url as ObjcId, release];
         }
     }
 }
@@ -55,8 +61,9 @@ fn enqueue_opened_url(url: ObjcId) {
     let mut opened_urls = OPENED_URLS.lock().unwrap();
     unsafe {
         msg_send_![url, retain];
+        let access_started: BOOL = msg_send![url, startAccessingSecurityScopedResource];
+        opened_urls.push_back((url as usize, access_started != NO));
     }
-    opened_urls.push_back(url as usize);
 }
 
 pub fn take_opened_urls() -> Vec<OpenedUrl> {
@@ -64,7 +71,10 @@ pub fn take_opened_urls() -> Vec<OpenedUrl> {
         .lock()
         .unwrap()
         .drain(..)
-        .map(|url| OpenedUrl(url as *mut std::ffi::c_void))
+        .map(|(url, access_started)| OpenedUrl {
+            url: url as *mut std::ffi::c_void,
+            access_started,
+        })
         .collect()
 }
 
