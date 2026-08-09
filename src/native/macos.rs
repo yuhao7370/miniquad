@@ -2,6 +2,8 @@
 //! sokol_app's objective C code and Makepad's (<https://github.com/makepad/makepad/blob/live/platform/src/platform/apple>)
 //! platform implementation
 //!
+use objc::runtime::Protocol;
+
 use {
     crate::{
         conf::{AppleGfxApi, Icon},
@@ -10,7 +12,9 @@ use {
             apple::{apple_util::*, frameworks::*},
             gl, NativeDisplayData, Request,
         },
-        native_display, CursorIcon,
+        native_display,
+        window::{self, ImeEvent},
+        CursorIcon,
     },
     std::{
         collections::HashMap,
@@ -42,6 +46,9 @@ pub struct MacosDisplay {
     native_requests: Receiver<Request>,
     update_requested: bool,
     last_paint_start_time: Instant,
+    ime_enabled: bool,
+    ime_position: (i32, i32),
+    ime_marked_utf16_len: u64,
 }
 
 impl MacosDisplay {
@@ -207,11 +214,24 @@ impl MacosDisplay {
             ShowKeyboard(..) => {
                 // Not applicable on macOS desktop
             }
-            SetImePosition { .. } => {
-                // IME position control not implemented for macOS yet
+            SetImePosition { x, y } => {
+                self.ime_position = (x, y);
             }
-            SetImeEnabled(..) => {
-                // IME enable/disable not implemented for macOS yet
+            SetImeEnabled(enabled) => {
+                if self.ime_enabled == enabled {
+                    return;
+                }
+                self.ime_enabled = enabled;
+                if !enabled {
+                    self.ime_marked_utf16_len = 0;
+                    unsafe {
+                        let input_context: ObjcId = msg_send![self.view, inputContext];
+                        if input_context != nil {
+                            let _: () = msg_send![input_context, discardMarkedText];
+                        }
+                    }
+                    window::push_ime_event(ImeEvent::End);
+                }
             }
         }
     }
@@ -483,6 +503,31 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
 
 // methods for both metal or OPENGL view
 unsafe fn view_base_decl(decl: &mut ClassDecl) {
+    unsafe fn text_input_string(value: ObjcId) -> String {
+        let attributed: BOOL = msg_send![value, isKindOfClass: class!(NSAttributedString)];
+        let value = if attributed == YES {
+            msg_send![value, string]
+        } else {
+            value
+        };
+        nsstring_to_string(value)
+    }
+
+    fn utf16_cursor_to_utf8(text: &str, cursor: u64) -> usize {
+        let mut utf16_offset = 0_u64;
+        for (byte_offset, character) in text.char_indices() {
+            if utf16_offset >= cursor {
+                return byte_offset;
+            }
+            let next = utf16_offset + character.len_utf16() as u64;
+            if next > cursor {
+                return byte_offset;
+            }
+            utf16_offset = next;
+        }
+        text.len()
+    }
+
     extern "C" fn mouse_moved(this: &Object, _sel: Sel, event: ObjcId) {
         let payload = get_window_payload(this);
 
@@ -584,12 +629,124 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
             }
         }
 
-        if let Some(character) = get_event_char(event) {
-            if let Some(event_handler) = payload.context() {
-                event_handler.char_event(character, mods, repeat);
+        unsafe {
+            if payload.ime_enabled {
+                let events: ObjcId = msg_send![class!(NSArray), arrayWithObject: event];
+                let _: () = msg_send![this, interpretKeyEvents: events];
+            } else if let Some(character) = get_event_char(event) {
+                if let Some(event_handler) = payload.context() {
+                    event_handler.char_event(character, mods, repeat);
+                }
             }
         }
     }
+
+    extern "C" fn has_marked_text(this: &Object, _sel: Sel) -> BOOL {
+        if get_window_payload(this).ime_marked_utf16_len == 0 {
+            NO
+        } else {
+            YES
+        }
+    }
+
+    extern "C" fn marked_range(this: &Object, _sel: Sel) -> NSRange {
+        let len = get_window_payload(this).ime_marked_utf16_len;
+        if len == 0 {
+            NSRange::new(u64::MAX, 0)
+        } else {
+            NSRange::new(0, len)
+        }
+    }
+
+    extern "C" fn selected_range(_this: &Object, _sel: Sel) -> NSRange {
+        NSRange::new(0, 0)
+    }
+
+    extern "C" fn set_marked_text(
+        this: &Object,
+        _sel: Sel,
+        value: ObjcId,
+        selected: NSRange,
+        _replacement: NSRange,
+    ) {
+        let text = unsafe { text_input_string(value) };
+        let payload = get_window_payload(this);
+        payload.ime_marked_utf16_len = text.encode_utf16().count() as u64;
+        let cursor_utf16 = selected.location.saturating_add(selected.length);
+        let cursor = utf16_cursor_to_utf8(&text, cursor_utf16);
+        window::push_ime_event(ImeEvent::Preedit {
+            text,
+            cursor: Some(cursor),
+        });
+    }
+
+    extern "C" fn unmark_text(this: &Object, _sel: Sel) {
+        get_window_payload(this).ime_marked_utf16_len = 0;
+        window::push_ime_event(ImeEvent::End);
+    }
+
+    extern "C" fn insert_text(this: &Object, _sel: Sel, value: ObjcId, _replacement: NSRange) {
+        let text = unsafe { text_input_string(value) };
+        let payload = get_window_payload(this);
+        payload.ime_marked_utf16_len = 0;
+        if let Some(event_handler) = payload.context() {
+            for character in text.chars() {
+                event_handler.char_event(character, Default::default(), false);
+            }
+        }
+        window::push_ime_event(ImeEvent::End);
+    }
+
+    extern "C" fn valid_attributes_for_marked_text(_this: &Object, _sel: Sel) -> ObjcId {
+        unsafe { msg_send![class!(NSArray), array] }
+    }
+
+    extern "C" fn attributed_substring(
+        _this: &Object,
+        _sel: Sel,
+        _range: NSRange,
+        actual: NSRangePointer,
+    ) -> ObjcId {
+        if !actual.0.is_null() {
+            unsafe { *actual.0 = NSRange::new(u64::MAX, 0) };
+        }
+        nil
+    }
+
+    extern "C" fn character_index_for_point(_this: &Object, _sel: Sel, _point: NSPoint) -> u64 {
+        0
+    }
+
+    extern "C" fn first_rect_for_character_range(
+        this: &Object,
+        _sel: Sel,
+        range: NSRange,
+        actual: NSRangePointer,
+    ) -> NSRect {
+        if !actual.0.is_null() {
+            unsafe { *actual.0 = range };
+        }
+        let payload = get_window_payload(this);
+        let dpi = native_display().lock().unwrap().dpi_scale.max(1.0) as f64;
+        unsafe {
+            let bounds: NSRect = msg_send![this, bounds];
+            let view_rect = NSRect {
+                origin: NSPoint {
+                    x: payload.ime_position.0 as f64 / dpi,
+                    y: bounds.size.height - payload.ime_position.1 as f64 / dpi,
+                },
+                size: NSSize {
+                    width: 1.0,
+                    height: 1.0,
+                },
+            };
+            let window_rect: NSRect = msg_send![this, convertRect: view_rect toView: nil];
+            let window: ObjcId = msg_send![this, window];
+            msg_send![window, convertRectToScreen: window_rect]
+        }
+    }
+
+    extern "C" fn do_command_by_selector(_this: &Object, _sel: Sel, _command: Sel) {}
 
     extern "C" fn key_up(this: &Object, _sel: Sel, event: ObjcId) {
         let payload = get_window_payload(this);
@@ -687,6 +844,9 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         payload.modifiers = new_modifiers;
     }
 
+    if let Some(protocol) = Protocol::get("NSTextInputClient") {
+        decl.add_protocol(protocol);
+    }
     decl.add_method(
         sel!(canBecomeKey),
         yes as extern "C" fn(&Object, Sel) -> BOOL,
@@ -753,6 +913,48 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         flags_changed as extern "C" fn(&Object, Sel, ObjcId),
     );
     decl.add_method(sel!(keyUp:), key_up as extern "C" fn(&Object, Sel, ObjcId));
+    decl.add_method(
+        sel!(hasMarkedText),
+        has_marked_text as extern "C" fn(&Object, Sel) -> BOOL,
+    );
+    decl.add_method(
+        sel!(markedRange),
+        marked_range as extern "C" fn(&Object, Sel) -> NSRange,
+    );
+    decl.add_method(
+        sel!(selectedRange),
+        selected_range as extern "C" fn(&Object, Sel) -> NSRange,
+    );
+    decl.add_method(
+        sel!(setMarkedText:selectedRange:replacementRange:),
+        set_marked_text as extern "C" fn(&Object, Sel, ObjcId, NSRange, NSRange),
+    );
+    decl.add_method(sel!(unmarkText), unmark_text as extern "C" fn(&Object, Sel));
+    decl.add_method(
+        sel!(insertText:replacementRange:),
+        insert_text as extern "C" fn(&Object, Sel, ObjcId, NSRange),
+    );
+    decl.add_method(
+        sel!(validAttributesForMarkedText),
+        valid_attributes_for_marked_text as extern "C" fn(&Object, Sel) -> ObjcId,
+    );
+    decl.add_method(
+        sel!(attributedSubstringForProposedRange:actualRange:),
+        attributed_substring as extern "C" fn(&Object, Sel, NSRange, NSRangePointer) -> ObjcId,
+    );
+    decl.add_method(
+        sel!(characterIndexForPoint:),
+        character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
+    );
+    decl.add_method(
+        sel!(firstRectForCharacterRange:actualRange:),
+        first_rect_for_character_range
+            as extern "C" fn(&Object, Sel, NSRange, NSRangePointer) -> NSRect,
+    );
+    decl.add_method(
+        sel!(doCommandBySelector:),
+        do_command_by_selector as extern "C" fn(&Object, Sel, Sel),
+    );
 }
 
 pub fn define_opengl_view_class() -> *const Class {
@@ -1105,6 +1307,9 @@ where
         modifiers: Modifiers::default(),
         update_requested: true,
         last_paint_start_time: Instant::now(),
+        ime_enabled: false,
+        ime_position: (0, 0),
+        ime_marked_utf16_len: 0,
     };
 
     let app_delegate_class = define_app_delegate();
