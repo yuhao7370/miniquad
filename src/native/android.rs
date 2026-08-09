@@ -4,6 +4,7 @@ use crate::{
         egl::{self, LibEgl},
         NativeDisplayData,
     },
+    window::{self, ImeEvent},
 };
 
 use std::{cell::RefCell, sync::mpsc, thread, time::Duration};
@@ -60,6 +61,14 @@ enum Message {
     Character {
         character: u32,
     },
+    ImePreedit {
+        text: String,
+        cursor: Option<usize>,
+    },
+    ImeCommit {
+        text: String,
+    },
+    ImeEnd,
     KeyDown {
         keycode: KeyCode,
     },
@@ -82,6 +91,35 @@ fn send_message(message: Message) {
         let mut tx = tx.borrow_mut();
         tx.as_mut().unwrap().send(message).unwrap();
     })
+}
+
+unsafe fn jstring_to_string(env: *mut ndk_sys::JNIEnv, value: ndk_sys::jstring) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let len = (**env).GetStringLength.unwrap()(env, value) as usize;
+    let chars = (**env).GetStringChars.unwrap()(env, value, std::ptr::null_mut());
+    if chars.is_null() {
+        return String::new();
+    }
+    let text = String::from_utf16_lossy(std::slice::from_raw_parts(chars, len));
+    (**env).ReleaseStringChars.unwrap()(env, value, chars);
+    text
+}
+
+fn utf16_cursor_to_utf8(text: &str, cursor: usize) -> usize {
+    let mut utf16_offset = 0;
+    for (byte_offset, character) in text.char_indices() {
+        if utf16_offset >= cursor {
+            return byte_offset;
+        }
+        let next = utf16_offset + character.len_utf16();
+        if next > cursor {
+            return byte_offset;
+        }
+        utf16_offset = next;
+    }
+    text.len()
 }
 
 pub static mut ACTIVITY: ndk_sys::jobject = std::ptr::null_mut();
@@ -242,6 +280,17 @@ impl MainThreadState {
                         .char_event(character, Default::default(), false);
                 }
             }
+            Message::ImePreedit { text, cursor } => {
+                window::push_ime_event(ImeEvent::Preedit { text, cursor });
+            }
+            Message::ImeCommit { text } => {
+                for character in text.chars() {
+                    self.event_handler
+                        .char_event(character, Default::default(), false);
+                }
+                window::push_ime_event(ImeEvent::End);
+            }
+            Message::ImeEnd => window::push_ime_event(ImeEvent::End),
             Message::KeyDown { keycode } => {
                 match keycode {
                     KeyCode::LeftShift | KeyCode::RightShift => self.keymods.shift = true,
@@ -319,9 +368,19 @@ impl MainThreadState {
             SetImePosition { .. } => {
                 // IME position control not applicable on Android
             }
-            SetImeEnabled(..) => {
-                // IME enable/disable not applicable on Android
-            }
+            SetImeEnabled(enabled) => unsafe {
+                let env = attach_jni_env();
+                ndk_utils::call_void_method!(
+                    env,
+                    ACTIVITY,
+                    "setImeEnabled",
+                    "(Z)V",
+                    enabled as i32
+                );
+                if !enabled {
+                    window::push_ime_event(ImeEvent::End);
+                }
+            },
             _ => {}
         }
     }
@@ -710,6 +769,37 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnCharacter(
     send_message(Message::Character {
         character: character as u32,
     });
+}
+
+#[no_mangle]
+unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImePreedit(
+    env: *mut ndk_sys::JNIEnv,
+    _: ndk_sys::jobject,
+    text: ndk_sys::jstring,
+    cursor: ndk_sys::jint,
+) {
+    let text = jstring_to_string(env, text);
+    let cursor = (cursor >= 0).then(|| utf16_cursor_to_utf8(&text, cursor as usize));
+    send_message(Message::ImePreedit { text, cursor });
+}
+
+#[no_mangle]
+unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeCommit(
+    env: *mut ndk_sys::JNIEnv,
+    _: ndk_sys::jobject,
+    text: ndk_sys::jstring,
+) {
+    send_message(Message::ImeCommit {
+        text: jstring_to_string(env, text),
+    });
+}
+
+#[no_mangle]
+extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeEnd(
+    _: *mut ndk_sys::JNIEnv,
+    _: ndk_sys::jobject,
+) {
+    send_message(Message::ImeEnd);
 }
 
 unsafe fn set_full_screen(env: *mut ndk_sys::JNIEnv, fullscreen: bool) {
