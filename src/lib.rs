@@ -117,6 +117,15 @@ fn native_display() -> &'static Mutex<native::NativeDisplayData> {
 /// Window and associated to window rendering context related functions.
 /// in macroquad <= 0.3, it was ctx.screen_size(). Now it is window::screen_size()
 pub mod window {
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum ImeEvent {
+        Preedit {
+            text: String,
+            cursor: Option<usize>,
+        },
+        End,
+    }
+
     #[derive(Clone, Copy, Debug)]
     pub struct TouchEvent {
         pub phase: crate::TouchPhase,
@@ -195,6 +204,31 @@ pub mod window {
 
     pub fn take_touch_events() -> Vec<TouchEvent> {
         std::mem::take(&mut native_display().lock().unwrap().pending_touch_events)
+    }
+
+    pub fn take_ime_events() -> Vec<ImeEvent> {
+        std::mem::take(&mut native_display().lock().unwrap().pending_ime_events)
+    }
+
+    pub(crate) fn push_ime_event(event: ImeEvent) {
+        let event = match event {
+            ImeEvent::Preedit { text, cursor } if !text.is_empty() => {
+                let cursor = cursor.map(|cursor| {
+                    let mut cursor = cursor.min(text.len());
+                    while !text.is_char_boundary(cursor) {
+                        cursor -= 1;
+                    }
+                    cursor
+                });
+                ImeEvent::Preedit { text, cursor }
+            }
+            ImeEvent::Preedit { .. } | ImeEvent::End => ImeEvent::End,
+        };
+        native_display()
+            .lock()
+            .unwrap()
+            .pending_ime_events
+            .push(event);
     }
 
     /// Monotonically increasing generation for iOS application resumes.

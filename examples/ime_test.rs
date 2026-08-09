@@ -180,6 +180,8 @@ struct TextVert { pos: [f32; 2], uv: [f32; 2], color: [f32; 4] }
 struct Stage {
     boxes: Vec<InputBox>,
     focus: Option<usize>,
+    preedit: String,
+    preedit_cursor: Option<usize>,
     color_pl: Pipeline,
     color_bind: Bindings,
     text_pl: Pipeline,
@@ -227,13 +229,27 @@ impl Stage {
             InputBox::new(50.0, 160.0, 500.0, 36.0),
         ];
 
-        Self { boxes, focus: None, color_pl, color_bind, text_pl, text_bind, tr, ctx, dpi }
+        Self {
+            boxes,
+            focus: None,
+            preedit: String::new(),
+            preedit_cursor: None,
+            color_pl,
+            color_bind,
+            text_pl,
+            text_bind,
+            tr,
+            ctx,
+            dpi,
+        }
     }
 
     fn update_ime(&mut self) {
         if let Some(i) = self.focus {
             let b = &self.boxes[i];
-            let x = (b.cursor_x(&mut self.tr) * self.dpi) as i32;
+            let cursor = self.preedit_cursor.unwrap_or(self.preedit.len());
+            let logical_x = b.cursor_x(&mut self.tr) + self.tr.measure(&self.preedit[..cursor]);
+            let x = (logical_x * self.dpi) as i32;
             let y = ((b.y + b.h) * self.dpi) as i32;
             // Use miniquad's built-in IME position API
             window::set_ime_position(x, y);
@@ -242,7 +258,21 @@ impl Stage {
 }
 
 impl EventHandler for Stage {
-    fn update(&mut self) {}
+    fn update(&mut self) {
+        for event in window::take_ime_events() {
+            match event {
+                window::ImeEvent::Preedit { text, cursor } => {
+                    self.preedit = text;
+                    self.preedit_cursor = cursor;
+                }
+                window::ImeEvent::End => {
+                    self.preedit.clear();
+                    self.preedit_cursor = None;
+                }
+            }
+        }
+        self.update_ime();
+    }
 
     fn draw(&mut self) {
         let (sw, sh) = window::screen_size();
@@ -260,15 +290,18 @@ impl EventHandler for Stage {
             let br = if f { [0.3, 0.5, 1.0, 1.0] } else { [0.3, 0.3, 0.35, 1.0] };
             rect(&mut cv, &mut ci, b.x, b.y, b.w, b.h, bg, sw, sh);
             outline(&mut cv, &mut ci, b.x, b.y, b.w, b.h, br, 2.0, sw, sh);
-            if f {
-                let cx = b.cursor_x(&mut self.tr);
-                rect(&mut cv, &mut ci, cx, b.y + 6.0, 2.0, b.h - 12.0, [1.0,1.0,1.0,0.9], sw, sh);
-            }
-
             // Draw text
             let mut x = b.x + 6.0;
             let baseline = b.y + b.h * 0.72;
-            for ch in b.text.chars() {
+            let cursor_byte = b.text.char_indices().nth(b.cursor)
+                .map(|(byte, _)| byte)
+                .unwrap_or(b.text.len());
+            let before = &b.text[..cursor_byte];
+            let preedit = if f { self.preedit.as_str() } else { "" };
+            let display = format!("{}{}{}", before, preedit, &b.text[cursor_byte..]);
+            let preedit_x = x + self.tr.measure(before);
+            let preedit_end_x = preedit_x + self.tr.measure(preedit);
+            for ch in display.chars() {
                 self.tr.cache_char(ch);
                 if let Some(g) = self.tr.cache.get(&ch) {
                     if g.size[0] > 0.0 {
@@ -278,6 +311,16 @@ impl EventHandler for Stage {
                     }
                     x += g.advance;
                 }
+            }
+            if f {
+                if !preedit.is_empty() {
+                    rect(&mut cv, &mut ci, preedit_x, baseline + 3.0,
+                        preedit_end_x - preedit_x, 1.5, [0.3,0.5,1.0,1.0], sw, sh);
+                }
+                let cursor = self.preedit_cursor.unwrap_or(preedit.len());
+                let cx = preedit_x + self.tr.measure(&preedit[..cursor]);
+                rect(&mut cv, &mut ci, cx, b.y + 6.0, 2.0, b.h - 12.0,
+                    [1.0,1.0,1.0,0.9], sw, sh);
             }
         }
 
@@ -315,6 +358,8 @@ impl EventHandler for Stage {
     }
 
     fn mouse_button_down_event(&mut self, _: MouseButton, x: f32, y: f32) {
+        self.preedit.clear();
+        self.preedit_cursor = None;
         self.focus = None;
         for (i, b) in self.boxes.iter_mut().enumerate() {
             b.focused = b.hit(x, y);
