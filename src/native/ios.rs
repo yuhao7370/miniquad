@@ -2,6 +2,7 @@
 //! sokol_app's objective C code and Makepad's (<https://github.com/makepad/makepad/blob/live/platform/src/platform/apple>)
 //! platform implementation
 //!
+use objc::runtime::Protocol;
 use {
     crate::{
         conf::{self, AppleGfxApi, Conf},
@@ -869,6 +870,8 @@ fn ios_will_resign_active() {
 pub fn define_scene_delegate() -> *const Class {
     let superclass = class!(UIResponder);
     let mut decl = ClassDecl::new("NSSceneDelegate", superclass).unwrap();
+    let window_scene_protocol = Protocol::get("UIWindowSceneDelegate").unwrap();
+    decl.add_protocol(window_scene_protocol);
 
     extern "C" fn scene_will_connect_to_session(
         this: &mut Object,
