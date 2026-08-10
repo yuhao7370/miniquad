@@ -32,6 +32,14 @@ extern "C" {
 
 static OPENED_URLS: Mutex<VecDeque<(usize, bool)>> = Mutex::new(VecDeque::new());
 
+pub type OpenedUrlHandler = unsafe fn(*mut c_void);
+
+static OPENED_URL_HANDLER: Mutex<Option<OpenedUrlHandler>> = Mutex::new(None);
+
+pub fn set_opened_url_handler(handler: OpenedUrlHandler) {
+    *OPENED_URL_HANDLER.lock().unwrap() = Some(handler);
+}
+
 pub struct OpenedUrl {
     url: *mut std::ffi::c_void,
     access_started: bool,
@@ -67,6 +75,21 @@ fn enqueue_opened_url(url: ObjcId) {
     }
 }
 
+fn dispatch_opened_url(url: ObjcId) {
+    if url.is_null() {
+        return;
+    }
+
+    let handler = *OPENED_URL_HANDLER.lock().unwrap();
+    if let Some(handler) = handler {
+        // UIKit owns this provider URL; let the application establish its own
+        // security-scoped lifetime before the callback returns.
+        unsafe { handler(url.cast()) };
+    } else {
+        enqueue_opened_url(url);
+    }
+}
+
 unsafe fn enqueue_url_contexts(contexts: ObjcId) {
     if contexts.is_null() {
         return;
@@ -76,7 +99,7 @@ unsafe fn enqueue_url_contexts(contexts: ObjcId) {
     for index in 0..count {
         let context: ObjcId = msg_send![all_objects, objectAtIndex: index];
         let url: ObjcId = msg_send![context, URL];
-        enqueue_opened_url(url);
+        dispatch_opened_url(url);
     }
 }
 
@@ -881,6 +904,9 @@ pub fn define_scene_delegate() -> *const Class {
         connection_options: ObjcId,
     ) {
         unsafe {
+            let contexts: ObjcId = msg_send![connection_options, URLContexts];
+            enqueue_url_contexts(contexts);
+
             let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
             let window_obj: ObjcId = msg_send![window_obj, initWithWindowScene: scene];
             if window_obj.is_null() {
@@ -899,9 +925,6 @@ pub fn define_scene_delegate() -> *const Class {
                 this.set_ivar("window", std::ptr::null_mut::<Object>());
                 return;
             }
-
-            let contexts: ObjcId = msg_send![connection_options, URLContexts];
-            enqueue_url_contexts(contexts);
         }
     }
 
@@ -966,13 +989,14 @@ pub fn define_app_delegate() -> *const Class {
             let screen_rect: NSRect = msg_send![main_screen, bounds];
             let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
             let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
-            initialize_ios_display(window_obj, screen_rect);
 
             if !launch_options.is_null() {
                 let url: ObjcId =
                     msg_send![launch_options, objectForKey: UIApplicationLaunchOptionsURLKey];
-                enqueue_opened_url(url);
+                dispatch_opened_url(url);
             }
+
+            initialize_ios_display(window_obj, screen_rect);
         }
         YES
     }
@@ -992,7 +1016,7 @@ pub fn define_app_delegate() -> *const Class {
         url: ObjcId,
         _: ObjcId,
     ) -> BOOL {
-        enqueue_opened_url(url);
+        dispatch_opened_url(url);
         if url.is_null() {
             NO
         } else {
@@ -1008,7 +1032,7 @@ pub fn define_app_delegate() -> *const Class {
         _: ObjcId,
         _: ObjcId,
     ) -> BOOL {
-        enqueue_opened_url(url);
+        dispatch_opened_url(url);
         if url.is_null() {
             NO
         } else {
