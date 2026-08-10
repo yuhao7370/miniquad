@@ -880,11 +880,22 @@ pub fn define_scene_delegate() -> *const Class {
         unsafe {
             let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
             let window_obj: ObjcId = msg_send![window_obj, initWithWindowScene: scene];
+            if window_obj.is_null() {
+                eprintln!("[miniquad] iOS Scene error: initWithWindowScene: returned null");
+                return;
+            }
             this.set_ivar("window", window_obj);
 
             let screen: ObjcId = msg_send![scene, screen];
             let screen_rect: NSRect = msg_send![screen, bounds];
-            initialize_ios_display(window_obj, screen_rect);
+            if !initialize_ios_display(window_obj, screen_rect) {
+                eprintln!(
+                    "[miniquad] iOS Scene error: display initialization failed for scene window"
+                );
+                msg_send_![window_obj, release];
+                this.set_ivar("window", std::ptr::null_mut::<Object>());
+                return;
+            }
 
             let contexts: ObjcId = msg_send![connection_options, URLContexts];
             enqueue_url_contexts(contexts);
