@@ -25,15 +25,11 @@ use {
     },
 };
 
-static OPENED_URLS: Mutex<VecDeque<(usize, bool)>> = Mutex::new(VecDeque::new());
-
-pub type OpenedUrlHandler = unsafe fn(*mut c_void);
-
-static OPENED_URL_HANDLER: Mutex<Option<OpenedUrlHandler>> = Mutex::new(None);
-
-pub fn set_opened_url_handler(handler: OpenedUrlHandler) {
-    *OPENED_URL_HANDLER.lock().unwrap() = Some(handler);
+extern "C" {
+    static UIApplicationLaunchOptionsURLKey: ObjcId;
 }
+
+static OPENED_URLS: Mutex<VecDeque<(usize, bool)>> = Mutex::new(VecDeque::new());
 
 pub struct OpenedUrl {
     url: *mut std::ffi::c_void,
@@ -70,17 +66,15 @@ fn enqueue_opened_url(url: ObjcId) {
     }
 }
 
-fn dispatch_opened_url(url: ObjcId) {
-    if url.is_null() {
+unsafe fn enqueue_url_contexts(contexts: ObjcId) {
+    if contexts.is_null() {
         return;
     }
-
-    let handler = *OPENED_URL_HANDLER.lock().unwrap();
-    if let Some(handler) = handler {
-        // A handler that continues asynchronously must retain the URL and establish
-        // its security scope before returning from UIKit's callback.
-        unsafe { handler(url.cast()) };
-    } else {
+    let all_objects: ObjcId = msg_send![contexts, allObjects];
+    let count: usize = msg_send![all_objects, count];
+    for index in 0..count {
+        let context: ObjcId = msg_send![all_objects, objectAtIndex: index];
+        let url: ObjcId = msg_send![context, URL];
         enqueue_opened_url(url);
     }
 }
@@ -680,6 +674,260 @@ fn define_glk_view_controller() -> *const Class {
     decl.register()
 }
 
+unsafe fn initialize_ios_display(window_obj: ObjcId, screen_rect: NSRect) -> bool {
+    let Some((f, conf)) = RUN_ARGS.take() else {
+        return false;
+    };
+
+    let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
+
+    let (_, _) = if conf.high_dpi {
+        let scale: f64 = msg_send![main_screen, scale];
+
+        (
+            (screen_rect.size.width * scale) as i32,
+            (screen_rect.size.height * scale) as i32,
+        )
+    } else {
+        (
+            screen_rect.size.width as i32,
+            screen_rect.size.height as i32,
+        )
+    };
+
+    let view = match conf.platform.apple_gfx_api {
+        AppleGfxApi::OpenGl => create_opengl_view(screen_rect, conf.sample_count, conf.high_dpi),
+        AppleGfxApi::Metal => create_metal_view(screen_rect, conf.sample_count, conf.high_dpi),
+    };
+
+    let (textfield_dlg, textfield) = {
+        let textfield_dlg = msg_send_![msg_send_![define_textfield_dlg(), alloc], init];
+        let textfield = msg_send_![
+                    msg_send_![class!(UITextField), alloc],
+                    initWithFrame:NSRect::new(10.0, 10.0, 100.0, 50.0)];
+        msg_send_![textfield, setAutocapitalizationType:0]; // UITextAutocapitalizationTypeNone
+        msg_send_![textfield, setAutocorrectionType:1]; // UITextAutocorrectionTypeNo
+        msg_send_![textfield, setSpellCheckingType:1]; // UITextSpellCheckingTypeNo
+        msg_send_![textfield, setHidden: YES];
+        msg_send_![textfield, setDelegate: textfield_dlg];
+        // to make backspace work - with empty text there is no event on text removal
+        msg_send_![textfield, setText: apple_util::str_to_nsstring("x")];
+        msg_send_![view.view, addSubview: textfield];
+
+        let notification_center = msg_send_![class!(NSNotificationCenter), defaultCenter];
+        msg_send_![notification_center, addObserver:textfield_dlg
+                           selector:sel!(keyboardWasShown:)
+                           name:UIKeyboardDidShowNotification object:nil];
+        msg_send_![notification_center, addObserver:textfield_dlg
+                           selector:sel!(keyboardWillBeHidden:)
+                           name:UIKeyboardWillHideNotification object:nil];
+        msg_send_![notification_center, addObserver:textfield_dlg
+                           selector:sel!(keyboardDidChangeFrame:)
+                           name:UIKeyboardDidChangeFrameNotification object:nil];
+        (textfield_dlg, textfield)
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx));
+
+    let clipboard = Box::new(IosClipboard);
+    let (tx, requests_rx) = std::sync::mpsc::channel();
+    crate::set_display(NativeDisplayData {
+        high_dpi: conf.high_dpi,
+        gfx_api: conf.platform.apple_gfx_api,
+        blocking_event_loop: conf.platform.blocking_event_loop,
+        view: view.view,
+        ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
+    });
+
+    let state_original = Arc::new(Mutex::new(MainThreadState {
+        quit: false,
+        paused: true,
+        update_requested: true,
+        view: view.view,
+        keymods: KeyMods {
+            shift: false,
+            ctrl: false,
+            alt: false,
+            logo: false,
+        },
+        cur_msg: Message::Resume,
+    }));
+
+    let payload = Box::new(IosDisplay {
+        view: view.view,
+        view_ctrl: view.view_ctrl,
+        textfield,
+        _textfield_dlg: textfield_dlg,
+        gfx_api: conf.platform.apple_gfx_api,
+
+        f: Some(Box::new(f)),
+        event_handler: None,
+        _gles2: view._gles2,
+        state: state_original.clone(),
+    });
+    let payload_ptr = Box::into_raw(payload) as *mut std::ffi::c_void;
+
+    (*view.view).set_ivar("display_ptr", payload_ptr);
+    (*view.view_dlg).set_ivar("display_ptr", payload_ptr);
+    (*textfield_dlg).set_ivar("display_ptr", payload_ptr);
+
+    msg_send_![window_obj, setRootViewController: view.view_ctrl];
+    msg_send_![window_obj, makeKeyAndVisible];
+    msg_send_![view.view_ctrl, setNeedsStatusBarAppearanceUpdate];
+
+    struct SendHack<F>(F);
+    unsafe impl<F> Send for SendHack<F> {}
+
+    let state = SendHack(state_original.clone());
+    thread::spawn(move || {
+        let s = state.0;
+
+        loop {
+            while let Ok(request) = requests_rx.try_recv() {
+                s.lock().unwrap().process_request(request);
+            }
+
+            let block_on_wait = {
+                let s = s.lock().unwrap();
+                (conf.platform.blocking_event_loop && !s.update_requested) || s.paused
+            };
+
+            if block_on_wait {
+                let res = rx.recv();
+
+                if let Ok(msg) = res {
+                    let view;
+                    {
+                        let mut s = s.lock().unwrap();
+                        view = s.view;
+                        s.cur_msg = msg;
+                    }
+                    msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
+                }
+            } else {
+                // process all the messages from the main thread
+                while let Ok(msg) = rx.try_recv() {
+                    let view;
+                    {
+                        let mut s = s.lock().unwrap();
+                        view = s.view;
+                        s.cur_msg = msg;
+                    }
+                    msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
+                }
+            }
+
+            let update_requested;
+            let view;
+            {
+                let s = s.lock().unwrap();
+                update_requested = s.update_requested;
+                view = s.view;
+            }
+
+            if !conf.platform.blocking_event_loop || update_requested {
+                match conf.platform.apple_gfx_api {
+                    AppleGfxApi::OpenGl => {
+                        // Why it differs from Metal? I don't realy know. Looks like a bug.
+                        // Somehow it needs `setNeedsDisplay` to redraw after touch.
+                        // With plain `display` it draws only after another touch.
+                        // But when it's not blocking_event_loop it makes fps really drop with `setNeedsDisplay`.
+                        // I hope it will work the same on the real device.
+                        if conf.platform.blocking_event_loop {
+                            msg_send_![&*view, performSelectorOnMainThread:sel!(setNeedsDisplay) withObject:nil waitUntilDone:NO];
+                        } else {
+                            msg_send_![&*view, performSelectorOnMainThread:sel!(display) withObject:nil waitUntilDone:YES];
+                        }
+                    }
+                    AppleGfxApi::Metal => {
+                        msg_send_![&*view, performSelectorOnMainThread:sel!(setNeedsDisplay) withObject:nil waitUntilDone:NO];
+                    }
+                }
+            }
+
+            thread::yield_now();
+        }
+    });
+
+    true
+}
+
+fn ios_did_become_active() {
+    let mut display = native_display().lock().unwrap();
+    display.ios_resume_generation = display.ios_resume_generation.wrapping_add(1);
+    drop(display);
+
+    send_message(Message::Resume);
+}
+
+fn ios_will_resign_active() {
+    send_message(Message::Pause);
+}
+
+pub fn define_scene_delegate() -> *const Class {
+    let superclass = class!(UIResponder);
+    let mut decl = ClassDecl::new("NSSceneDelegate", superclass).unwrap();
+
+    extern "C" fn scene_will_connect_to_session(
+        this: &mut Object,
+        _: Sel,
+        scene: ObjcId,
+        _: ObjcId,
+        connection_options: ObjcId,
+    ) {
+        unsafe {
+            let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
+            let window_obj: ObjcId = msg_send![window_obj, initWithWindowScene: scene];
+            this.set_ivar("window", window_obj);
+
+            let screen: ObjcId = msg_send![scene, screen];
+            let screen_rect: NSRect = msg_send![screen, bounds];
+            initialize_ios_display(window_obj, screen_rect);
+
+            let contexts: ObjcId = msg_send![connection_options, URLContexts];
+            enqueue_url_contexts(contexts);
+        }
+    }
+
+    extern "C" fn scene_open_url_contexts(_: &Object, _: Sel, _: ObjcId, contexts: ObjcId) {
+        unsafe {
+            enqueue_url_contexts(contexts);
+        }
+    }
+
+    extern "C" fn scene_did_become_active(_: &Object, _: Sel, _: ObjcId) {
+        ios_did_become_active();
+    }
+
+    extern "C" fn scene_will_resign_active(_: &Object, _: Sel, _: ObjcId) {
+        ios_will_resign_active();
+    }
+
+    decl.add_ivar::<ObjcId>("window");
+    unsafe {
+        decl.add_method(
+            sel!(scene: willConnectToSession: options:),
+            scene_will_connect_to_session
+                as extern "C" fn(&mut Object, Sel, ObjcId, ObjcId, ObjcId),
+        );
+        decl.add_method(
+            sel!(scene: openURLContexts:),
+            scene_open_url_contexts as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
+        );
+        decl.add_method(
+            sel!(sceneDidBecomeActive:),
+            scene_did_become_active as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(sceneWillResignActive:),
+            scene_will_resign_active as extern "C" fn(&Object, Sel, ObjcId),
+        );
+    }
+    decl.register()
+}
+
 pub fn define_app_delegate() -> *const Class {
     let superclass = class!(NSObject);
     let mut decl = ClassDecl::new("NSAppDelegate", superclass).unwrap();
@@ -688,213 +936,39 @@ pub fn define_app_delegate() -> *const Class {
         _: &Object,
         _: Sel,
         _: ObjcId,
-        _launch_options: ObjcId,
+        launch_options: ObjcId,
     ) -> BOOL {
         unsafe {
-            let (f, conf) = RUN_ARGS.take().unwrap();
+            let main_bundle: ObjcId = msg_send![class!(NSBundle), mainBundle];
+            let scene_manifest: ObjcId = msg_send![
+                main_bundle,
+                objectForInfoDictionaryKey: apple_util::str_to_nsstring("UIApplicationSceneManifest")
+            ];
+            if !scene_manifest.is_null() {
+                return YES;
+            }
 
             let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
             let screen_rect: NSRect = msg_send![main_screen, bounds];
-
-            let (_, _) = if conf.high_dpi {
-                let scale: f64 = msg_send![main_screen, scale];
-
-                (
-                    (screen_rect.size.width * scale) as i32,
-                    (screen_rect.size.height * scale) as i32,
-                )
-            } else {
-                (
-                    screen_rect.size.width as i32,
-                    screen_rect.size.height as i32,
-                )
-            };
-
             let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
             let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
+            initialize_ios_display(window_obj, screen_rect);
 
-            let view = match conf.platform.apple_gfx_api {
-                AppleGfxApi::OpenGl => {
-                    create_opengl_view(screen_rect, conf.sample_count, conf.high_dpi)
-                }
-                AppleGfxApi::Metal => {
-                    create_metal_view(screen_rect, conf.sample_count, conf.high_dpi)
-                }
-            };
-
-            let (textfield_dlg, textfield) = {
-                let textfield_dlg = msg_send_![msg_send_![define_textfield_dlg(), alloc], init];
-                let textfield = msg_send_![
-                    msg_send_![class!(UITextField), alloc],
-                    initWithFrame:NSRect::new(10.0, 10.0, 100.0, 50.0)];
-                msg_send_![textfield, setAutocapitalizationType:0]; // UITextAutocapitalizationTypeNone
-                msg_send_![textfield, setAutocorrectionType:1]; // UITextAutocorrectionTypeNo
-                msg_send_![textfield, setSpellCheckingType:1]; // UITextSpellCheckingTypeNo
-                msg_send_![textfield, setHidden: YES];
-                msg_send_![textfield, setDelegate: textfield_dlg];
-                // to make backspace work - with empty text there is no event on text removal
-                msg_send_![textfield, setText: apple_util::str_to_nsstring("x")];
-                msg_send_![view.view, addSubview: textfield];
-
-                let notification_center = msg_send_![class!(NSNotificationCenter), defaultCenter];
-                msg_send_![notification_center, addObserver:textfield_dlg
-                           selector:sel!(keyboardWasShown:)
-                           name:UIKeyboardDidShowNotification object:nil];
-                msg_send_![notification_center, addObserver:textfield_dlg
-                           selector:sel!(keyboardWillBeHidden:)
-                           name:UIKeyboardWillHideNotification object:nil];
-                msg_send_![notification_center, addObserver:textfield_dlg
-                           selector:sel!(keyboardDidChangeFrame:)
-                           name:UIKeyboardDidChangeFrameNotification object:nil];
-                (textfield_dlg, textfield)
-            };
-
-            let (tx, rx) = std::sync::mpsc::channel();
-
-            MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx));
-
-            let clipboard = Box::new(IosClipboard);
-            let (tx, requests_rx) = std::sync::mpsc::channel();
-            crate::set_display(NativeDisplayData {
-                high_dpi: conf.high_dpi,
-                gfx_api: conf.platform.apple_gfx_api,
-                blocking_event_loop: conf.platform.blocking_event_loop,
-                view: view.view,
-                ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
-            });
-
-            let state_original = Arc::new(Mutex::new(MainThreadState {
-                quit: false,
-                paused: true,
-                update_requested: true,
-                view: view.view,
-                keymods: KeyMods {
-                    shift: false,
-                    ctrl: false,
-                    alt: false,
-                    logo: false,
-                },
-                cur_msg: Message::Resume,
-            }));
-
-            let payload = Box::new(IosDisplay {
-                view: view.view,
-                view_ctrl: view.view_ctrl,
-                textfield,
-                _textfield_dlg: textfield_dlg,
-                gfx_api: conf.platform.apple_gfx_api,
-
-                f: Some(Box::new(f)),
-                event_handler: None,
-                _gles2: view._gles2,
-                state: state_original.clone(),
-            });
-            let payload_ptr = Box::into_raw(payload) as *mut std::ffi::c_void;
-
-            (*view.view).set_ivar("display_ptr", payload_ptr);
-            (*view.view_dlg).set_ivar("display_ptr", payload_ptr);
-            (*textfield_dlg).set_ivar("display_ptr", payload_ptr);
-
-            msg_send_![window_obj, setRootViewController: view.view_ctrl];
-            msg_send_![window_obj, makeKeyAndVisible];
-            msg_send_![view.view_ctrl, setNeedsStatusBarAppearanceUpdate];
-
-            struct SendHack<F>(F);
-            unsafe impl<F> Send for SendHack<F> {}
-
-            let state = SendHack(state_original.clone());
-            thread::spawn(move || {
-                let s = state.0;
-
-                loop {
-                    while let Ok(request) = requests_rx.try_recv() {
-                        s.lock().unwrap().process_request(request);
-                    }
-
-                    let block_on_wait = {
-                        let s = s.lock().unwrap();
-                        (conf.platform.blocking_event_loop && !s.update_requested) || s.paused
-                    };
-
-                    if block_on_wait {
-                        let res = rx.recv();
-
-                        if let Ok(msg) = res {
-                            let view;
-                            {
-                                let mut s = s.lock().unwrap();
-                                view = s.view;
-                                s.cur_msg = msg;
-                            }
-                            msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
-                        }
-                    } else {
-                        // process all the messages from the main thread
-                        while let Ok(msg) = rx.try_recv() {
-                            let view;
-                            {
-                                let mut s = s.lock().unwrap();
-                                view = s.view;
-                                s.cur_msg = msg;
-                            }
-                            msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
-                        }
-                    }
-
-                    let update_requested;
-                    let view;
-                    {
-                        let s = s.lock().unwrap();
-                        update_requested = s.update_requested;
-                        view = s.view;
-                    }
-
-                    if !conf.platform.blocking_event_loop || update_requested {
-                        match conf.platform.apple_gfx_api {
-                            AppleGfxApi::OpenGl => {
-                                // Why it differs from Metal? I don't realy know. Looks like a bug.
-                                // Somehow it needs `setNeedsDisplay` to redraw after touch.
-                                // With plain `display` it draws only after another touch.
-                                // But when it's not blocking_event_loop it makes fps really drop with `setNeedsDisplay`.
-                                // I hope it will work the same on the real device.
-                                if conf.platform.blocking_event_loop {
-                                    msg_send_![&*view, performSelectorOnMainThread:sel!(setNeedsDisplay) withObject:nil waitUntilDone:NO];
-                                } else {
-                                    msg_send_![&*view, performSelectorOnMainThread:sel!(display) withObject:nil waitUntilDone:YES];
-                                }
-                            }
-                            AppleGfxApi::Metal => {
-                                msg_send_![&*view, performSelectorOnMainThread:sel!(setNeedsDisplay) withObject:nil waitUntilDone:NO];
-                            }
-                        }
-                    }
-
-                    thread::yield_now();
-                }
-            });
+            if !launch_options.is_null() {
+                let url: ObjcId =
+                    msg_send![launch_options, objectForKey: UIApplicationLaunchOptionsURLKey];
+                enqueue_opened_url(url);
+            }
         }
         YES
     }
 
     extern "C" fn application_did_become_active(_: &Object, _: Sel, _: ObjcId) {
-        let mut display = native_display().lock().unwrap();
-        display.ios_resume_generation = display.ios_resume_generation.wrapping_add(1);
-        drop(display);
-
-        send_message(Message::Resume);
+        ios_did_become_active();
     }
 
     extern "C" fn application_will_resign_active(_: &Object, _: Sel, _: ObjcId) {
-        send_message(Message::Pause);
-    }
-
-    fn handle_application_open_url(url: ObjcId) -> BOOL {
-        if url.is_null() {
-            NO
-        } else {
-            dispatch_opened_url(url);
-            YES
-        }
+        ios_will_resign_active();
     }
 
     extern "C" fn application_open_url(
@@ -904,7 +978,12 @@ pub fn define_app_delegate() -> *const Class {
         url: ObjcId,
         _: ObjcId,
     ) -> BOOL {
-        handle_application_open_url(url)
+        enqueue_opened_url(url);
+        if url.is_null() {
+            NO
+        } else {
+            YES
+        }
     }
 
     extern "C" fn application_open_url_legacy(
@@ -915,7 +994,12 @@ pub fn define_app_delegate() -> *const Class {
         _: ObjcId,
         _: ObjcId,
     ) -> BOOL {
-        handle_application_open_url(url)
+        enqueue_opened_url(url);
+        if url.is_null() {
+            NO
+        } else {
+            YES
+        }
     }
 
     unsafe {
@@ -1092,6 +1176,7 @@ where
     let argc = 1;
     let mut argv = b"Miniquad\0" as *const u8 as *mut i8;
 
+    define_scene_delegate();
     let class: ObjcId = msg_send!(define_app_delegate(), class);
     let class_string = frameworks::NSStringFromClass(class as _);
 
