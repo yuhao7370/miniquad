@@ -21,7 +21,10 @@ use {
         cell::RefCell,
         collections::VecDeque,
         os::raw::c_void,
-        sync::{mpsc, Arc, Mutex},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc, Arc, Mutex,
+        },
         thread::{self},
     },
 };
@@ -31,6 +34,10 @@ extern "C" {
 }
 
 static OPENED_URLS: Mutex<VecDeque<(usize, bool)>> = Mutex::new(VecDeque::new());
+static IOS_DIAGNOSTIC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static IOS_DIAGNOSTICS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+const MAX_IOS_DIAGNOSTICS: usize = 12;
 
 pub type OpenedUrlHandler = unsafe fn(*mut c_void);
 
@@ -38,6 +45,23 @@ static OPENED_URL_HANDLER: Mutex<Option<OpenedUrlHandler>> = Mutex::new(None);
 
 pub fn set_opened_url_handler(handler: OpenedUrlHandler) {
     *OPENED_URL_HANDLER.lock().unwrap() = Some(handler);
+    push_ios_diagnostic("handler.registered".to_owned());
+}
+
+pub fn push_ios_diagnostic(message: String) {
+    let sequence = IOS_DIAGNOSTIC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let message = format!("{sequence}: {message}");
+    eprintln!("[miniquad] {message}");
+
+    let mut diagnostics = IOS_DIAGNOSTICS.lock().unwrap();
+    if diagnostics.len() >= MAX_IOS_DIAGNOSTICS {
+        diagnostics.pop_front();
+    }
+    diagnostics.push_back(message);
+}
+
+pub fn take_ios_diagnostics() -> Vec<String> {
+    IOS_DIAGNOSTICS.lock().unwrap().drain(..).collect()
 }
 
 pub struct OpenedUrl {
@@ -77,10 +101,23 @@ fn enqueue_opened_url(url: ObjcId) {
 
 fn dispatch_opened_url(url: ObjcId) {
     if url.is_null() {
+        push_ios_diagnostic("url.dispatch null".to_owned());
         return;
     }
 
     let handler = *OPENED_URL_HANDLER.lock().unwrap();
+    let name = unsafe {
+        let name: ObjcId = msg_send![url, lastPathComponent];
+        if name.is_null() {
+            "<no-name>".to_owned()
+        } else {
+            apple_util::nsstring_to_string(name)
+        }
+    };
+    push_ios_diagnostic(format!(
+        "url.dispatch name={name} handler={}",
+        handler.is_some()
+    ));
     if let Some(handler) = handler {
         // UIKit owns this provider URL; let the application establish its own
         // security-scoped lifetime before the callback returns.
@@ -90,12 +127,14 @@ fn dispatch_opened_url(url: ObjcId) {
     }
 }
 
-unsafe fn enqueue_url_contexts(contexts: ObjcId) {
+unsafe fn enqueue_url_contexts(source: &str, contexts: ObjcId) {
     if contexts.is_null() {
+        push_ios_diagnostic(format!("{source} contexts=null"));
         return;
     }
     let all_objects: ObjcId = msg_send![contexts, allObjects];
     let count: usize = msg_send![all_objects, count];
+    push_ios_diagnostic(format!("{source} contexts={count}"));
     for index in 0..count {
         let context: ObjcId = msg_send![all_objects, objectAtIndex: index];
         let url: ObjcId = msg_send![context, URL];
@@ -879,6 +918,7 @@ unsafe fn initialize_ios_display(window_obj: ObjcId, screen_rect: NSRect) -> boo
 }
 
 fn ios_did_become_active() {
+    push_ios_diagnostic("lifecycle.didBecomeActive".to_owned());
     let mut display = native_display().lock().unwrap();
     display.ios_resume_generation = display.ios_resume_generation.wrapping_add(1);
     drop(display);
@@ -887,6 +927,7 @@ fn ios_did_become_active() {
 }
 
 fn ios_will_resign_active() {
+    push_ios_diagnostic("lifecycle.willResignActive".to_owned());
     send_message(Message::Pause);
 }
 
@@ -905,7 +946,7 @@ pub fn define_scene_delegate() -> *const Class {
     ) {
         unsafe {
             let contexts: ObjcId = msg_send![connection_options, URLContexts];
-            enqueue_url_contexts(contexts);
+            enqueue_url_contexts("scene.willConnect", contexts);
 
             let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
             let window_obj: ObjcId = msg_send![window_obj, initWithWindowScene: scene];
@@ -930,7 +971,7 @@ pub fn define_scene_delegate() -> *const Class {
 
     extern "C" fn scene_open_url_contexts(_: &Object, _: Sel, _: ObjcId, contexts: ObjcId) {
         unsafe {
-            enqueue_url_contexts(contexts);
+            enqueue_url_contexts("scene.openURLContexts", contexts);
         }
     }
 
@@ -981,6 +1022,16 @@ pub fn define_app_delegate() -> *const Class {
                 main_bundle,
                 objectForInfoDictionaryKey: apple_util::str_to_nsstring("UIApplicationSceneManifest")
             ];
+            let launch_url: ObjcId = if launch_options.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg_send![launch_options, objectForKey: UIApplicationLaunchOptionsURLKey]
+            };
+            push_ios_diagnostic(format!(
+                "app.didFinish sceneManifest={} launchURL={}",
+                !scene_manifest.is_null(),
+                !launch_url.is_null()
+            ));
             if !scene_manifest.is_null() {
                 return YES;
             }
@@ -990,11 +1041,7 @@ pub fn define_app_delegate() -> *const Class {
             let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
             let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
 
-            if !launch_options.is_null() {
-                let url: ObjcId =
-                    msg_send![launch_options, objectForKey: UIApplicationLaunchOptionsURLKey];
-                dispatch_opened_url(url);
-            }
+            dispatch_opened_url(launch_url);
 
             initialize_ios_display(window_obj, screen_rect);
         }
@@ -1016,6 +1063,7 @@ pub fn define_app_delegate() -> *const Class {
         url: ObjcId,
         _: ObjcId,
     ) -> BOOL {
+        push_ios_diagnostic("app.openURL.options".to_owned());
         dispatch_opened_url(url);
         if url.is_null() {
             NO
@@ -1032,6 +1080,7 @@ pub fn define_app_delegate() -> *const Class {
         _: ObjcId,
         _: ObjcId,
     ) -> BOOL {
+        push_ios_diagnostic("app.openURL.legacy".to_owned());
         dispatch_opened_url(url);
         if url.is_null() {
             NO
