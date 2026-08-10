@@ -1043,6 +1043,8 @@ pub fn define_app_delegate() -> *const Class {
             let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
             let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
 
+            dispatch_opened_url(launch_url);
+
             initialize_ios_display(window_obj, screen_rect);
         }
         YES
