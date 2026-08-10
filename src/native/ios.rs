@@ -1009,8 +1009,6 @@ pub fn define_scene_delegate() -> *const Class {
 pub fn define_app_delegate() -> *const Class {
     let superclass = class!(NSObject);
     let mut decl = ClassDecl::new("NSAppDelegate", superclass).unwrap();
-    let application_delegate_protocol = Protocol::get("UIApplicationDelegate").unwrap();
-    decl.add_protocol(application_delegate_protocol);
 
     extern "C" fn did_finish_launching_with_options(
         _: &Object,
