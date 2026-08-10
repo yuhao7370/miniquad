@@ -25,10 +25,6 @@ use {
     },
 };
 
-extern "C" {
-    static UIApplicationLaunchOptionsURLKey: ObjcId;
-}
-
 static OPENED_URLS: Mutex<VecDeque<(usize, bool)>> = Mutex::new(VecDeque::new());
 
 pub type OpenedUrlHandler = unsafe fn(*mut c_void);
@@ -81,7 +77,8 @@ fn dispatch_opened_url(url: ObjcId) {
 
     let handler = *OPENED_URL_HANDLER.lock().unwrap();
     if let Some(handler) = handler {
-        // The application must adopt provider-owned contents before UIKit's callback returns.
+        // A handler that continues asynchronously must retain the URL and establish
+        // its security scope before returning from UIKit's callback.
         unsafe { handler(url.cast()) };
     } else {
         enqueue_opened_url(url);
@@ -691,15 +688,9 @@ pub fn define_app_delegate() -> *const Class {
         _: &Object,
         _: Sel,
         _: ObjcId,
-        launch_options: ObjcId,
+        _launch_options: ObjcId,
     ) -> BOOL {
         unsafe {
-            if !launch_options.is_null() {
-                let url: ObjcId =
-                    msg_send![launch_options, objectForKey: UIApplicationLaunchOptionsURLKey];
-                dispatch_opened_url(url);
-            }
-
             let (f, conf) = RUN_ARGS.take().unwrap();
 
             let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
@@ -897,6 +888,15 @@ pub fn define_app_delegate() -> *const Class {
         send_message(Message::Pause);
     }
 
+    fn handle_application_open_url(url: ObjcId) -> BOOL {
+        if url.is_null() {
+            NO
+        } else {
+            dispatch_opened_url(url);
+            YES
+        }
+    }
+
     extern "C" fn application_open_url(
         _: &Object,
         _: Sel,
@@ -904,12 +904,18 @@ pub fn define_app_delegate() -> *const Class {
         url: ObjcId,
         _: ObjcId,
     ) -> BOOL {
-        if url.is_null() {
-            NO
-        } else {
-            dispatch_opened_url(url);
-            YES
-        }
+        handle_application_open_url(url)
+    }
+
+    extern "C" fn application_open_url_legacy(
+        _: &Object,
+        _: Sel,
+        _: ObjcId,
+        url: ObjcId,
+        _: ObjcId,
+        _: ObjcId,
+    ) -> BOOL {
+        handle_application_open_url(url)
     }
 
     unsafe {
@@ -929,6 +935,11 @@ pub fn define_app_delegate() -> *const Class {
         decl.add_method(
             sel!(application: openURL: options:),
             application_open_url as extern "C" fn(&Object, Sel, ObjcId, ObjcId, ObjcId) -> BOOL,
+        );
+        decl.add_method(
+            sel!(application: openURL: sourceApplication: annotation:),
+            application_open_url_legacy
+                as extern "C" fn(&Object, Sel, ObjcId, ObjcId, ObjcId, ObjcId) -> BOOL,
         );
     }
     decl.register()
