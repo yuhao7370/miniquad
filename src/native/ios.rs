@@ -1024,12 +1024,12 @@ pub fn define_scene_delegate() -> *const Class {
     decl.add_ivar::<ObjcId>("window");
     unsafe {
         decl.add_method(
-            sel!(scene: willConnectToSession: options:),
+            sel!(scene:willConnectToSession:options:),
             scene_will_connect_to_session
                 as extern "C" fn(&mut Object, Sel, ObjcId, ObjcId, ObjcId),
         );
         decl.add_method(
-            sel!(scene: openURLContexts:),
+            sel!(scene:openURLContexts:),
             scene_open_url_contexts as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
         );
         decl.add_method(
