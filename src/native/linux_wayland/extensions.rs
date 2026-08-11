@@ -2,6 +2,7 @@
 
 pub mod cursor;
 pub mod libdecor;
+pub mod text_input;
 pub mod viewporter;
 pub mod xdg_decoration;
 pub mod xdg_shell;

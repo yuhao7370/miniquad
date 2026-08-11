@@ -15,6 +15,7 @@ use {
             NativeDisplayData,
         },
         native_display,
+        window::{self, ImeEvent},
     },
     std::{
         cell::RefCell,
@@ -38,6 +39,7 @@ struct IosDisplay {
     view_ctrl: ObjcId,
     _textfield_dlg: ObjcId,
     textfield: ObjcId,
+    ime_enabled: bool,
     gfx_api: conf::AppleGfxApi,
 
     event_handler: Option<Box<dyn EventHandler>>,
@@ -47,9 +49,20 @@ struct IosDisplay {
 }
 
 impl IosDisplay {
+    fn reset_textfield(&mut self) {
+        unsafe {
+            msg_send_![self.textfield, setText: apple_util::str_to_nsstring("x")];
+            let end: ObjcId = msg_send_![self.textfield, endOfDocument];
+            let selection: ObjcId = msg_send_![self.textfield,
+                textRangeFromPosition:end toPosition:end];
+            msg_send_![self.textfield, setSelectedTextRange: selection];
+        }
+    }
+
     fn show_keyboard(&mut self, show: bool) {
         unsafe {
             if show {
+                self.reset_textfield();
                 msg_send_![self.textfield, becomeFirstResponder];
             } else {
                 msg_send_![self.textfield, resignFirstResponder];
@@ -81,26 +94,13 @@ fn get_window_payload(this: &Object) -> &mut IosDisplay {
 
 #[derive(Debug, Clone, Copy)]
 enum Message {
-    Resize {
-        width: i32,
-        height: i32,
-    },
-    Touch {
-        phase: TouchPhase,
-        touch_id: u64,
-        time: f64,
-        x: f32,
-        y: f32,
-    },
-    Character {
-        character: u32,
-    },
-    KeyDown {
-        keycode: KeyCode,
-    },
-    KeyUp {
-        keycode: KeyCode,
-    },
+    Resize { width: i32, height: i32 },
+    Character { character: u32 },
+    KeyDown { keycode: KeyCode },
+    KeyUp { keycode: KeyCode },
+    ShowKeyboard(bool),
+    SetImeEnabled(bool),
+    Wake,
     Pause,
     Resume,
     Destroy,
@@ -112,21 +112,21 @@ thread_local! {
 }
 
 impl MainThreadState {
-    fn process_request(&mut self, request: crate::native::Request) {
+    fn process_request(&mut self, request: crate::native::Request) -> Option<Message> {
         use crate::native::Request::*;
 
         match request {
             ScheduleUpdate => {
                 self.update_requested = true;
             }
+            ShowKeyboard(show) => return Some(Message::ShowKeyboard(show)),
             SetImePosition { .. } => {
                 // IME position control not applicable on iOS
             }
-            SetImeEnabled(..) => {
-                // IME enable/disable not applicable on iOS
-            }
+            SetImeEnabled(enabled) => return Some(Message::SetImeEnabled(enabled)),
             _ => {}
         }
+        None
     }
 }
 
@@ -137,6 +137,13 @@ fn send_message(message: Message) {
     })
 }
 
+pub(crate) fn touch_time_now() -> f64 {
+    unsafe {
+        let process_info: ObjcId = msg_send![class!(NSProcessInfo), processInfo];
+        msg_send![process_info, systemUptime]
+    }
+}
+
 pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
     let mut decl = ClassDecl::new("QuadView", superclass).unwrap();
 
@@ -144,10 +151,10 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         unsafe {
             let size: u64 = msg_send![touches, count];
             let enumerator: ObjcId = msg_send![touches, objectEnumerator];
-            let process_info: ObjcId = msg_send![class!(NSProcessInfo), processInfo];
-            let system_uptime: f64 = msg_send![process_info, systemUptime];
-            let now: ObjcId = msg_send![class!(NSDate), date];
-            let wall_time: f64 = msg_send![now, timeIntervalSince1970];
+            let payload = get_window_payload(this);
+            if payload.event_handler.is_none() {
+                payload.init_event_handler();
+            }
 
             for _ in 0..size {
                 let ios_touch: ObjcId = msg_send![enumerator, nextObject];
@@ -168,13 +175,45 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                     ios_pos.y *= content_scale_factor;
                 }
 
-                send_message(Message::Touch {
-                    phase,
-                    touch_id,
-                    time: wall_time - (system_uptime - touch_timestamp),
-                    x: ios_pos.x as f32,
-                    y: ios_pos.y as f32,
-                });
+                let x = ios_pos.x as f32;
+                let y = ios_pos.y as f32;
+                {
+                    let mut display = native_display().lock().unwrap();
+                    display
+                        .pending_touch_events
+                        .push(crate::window::TouchEvent {
+                            phase,
+                            id: touch_id,
+                            time: touch_timestamp,
+                            x,
+                            y,
+                        });
+                    if phase == TouchPhase::Started {
+                        display.touch_start_times.insert(touch_id, touch_timestamp);
+                        display
+                            .pending_touch_starts
+                            .push(crate::window::TouchStart {
+                                id: touch_id,
+                                time: touch_timestamp,
+                                x,
+                                y,
+                            });
+                    }
+                }
+                if let Some(ref mut event_handler) = payload.event_handler {
+                    event_handler.touch_event(phase, touch_id, x, y);
+                }
+                if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                    native_display()
+                        .lock()
+                        .unwrap()
+                        .touch_start_times
+                        .remove(&touch_id);
+                }
+            }
+            let blocking_event_loop = native_display().lock().unwrap().blocking_event_loop;
+            if blocking_event_loop {
+                send_message(Message::Wake);
             }
         }
     }
@@ -216,47 +255,7 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                 let mut state = payload.state.lock().unwrap();
                 state.quit = true;
             }
-            Message::Touch {
-                phase,
-                touch_id,
-                time,
-                x,
-                y,
-            } => {
-                {
-                    let mut display = native_display().lock().unwrap();
-                    display
-                        .pending_touch_events
-                        .push(crate::window::TouchEvent {
-                            phase,
-                            id: touch_id,
-                            time,
-                            x,
-                            y,
-                        });
-                    if phase == TouchPhase::Started {
-                        display.touch_start_times.insert(touch_id, time);
-                        display
-                            .pending_touch_starts
-                            .push(crate::window::TouchStart {
-                                id: touch_id,
-                                time,
-                                x,
-                                y,
-                            });
-                    }
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.touch_event(phase, touch_id, x, y);
-                }
-                if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
-                    native_display()
-                        .lock()
-                        .unwrap()
-                        .touch_start_times
-                        .remove(&touch_id);
-                }
-            }
+            Message::Wake => {}
             Message::Character { character } => {
                 if let Some(character) = char::from_u32(character) {
                     if let Some(ref mut event_handler) = payload.event_handler {
@@ -288,6 +287,14 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                 }
                 if let Some(ref mut event_handler) = payload.event_handler {
                     event_handler.key_up_event(keycode, state.keymods);
+                }
+            }
+            Message::ShowKeyboard(show) => payload.show_keyboard(show),
+            Message::SetImeEnabled(enabled) => {
+                payload.ime_enabled = enabled;
+                if !enabled {
+                    payload.reset_textfield();
+                    window::push_ime_event(ImeEvent::End);
                 }
             }
             Message::Resize { width, height } => {
@@ -616,8 +623,7 @@ fn define_glk_view_controller() -> *const Class {
         );
         decl.add_method(
             sel!(preferredScreenEdgesDeferringSystemGestures),
-            preferred_screen_edges_deferring_system_gestures
-                as extern "C" fn(&Object, Sel) -> i32,
+            preferred_screen_edges_deferring_system_gestures as extern "C" fn(&Object, Sel) -> i32,
         );
     }
 
@@ -670,13 +676,17 @@ pub fn define_app_delegate() -> *const Class {
                 let textfield_dlg = msg_send_![msg_send_![define_textfield_dlg(), alloc], init];
                 let textfield = msg_send_![
                     msg_send_![class!(UITextField), alloc],
-                    initWithFrame:NSRect::new(10.0, 10.0, 100.0, 50.0)];
+                    initWithFrame:NSRect::new(-100.0, -100.0, 1.0, 1.0)];
                 msg_send_![textfield, setAutocapitalizationType:0]; // UITextAutocapitalizationTypeNone
                 msg_send_![textfield, setAutocorrectionType:1]; // UITextAutocorrectionTypeNo
                 msg_send_![textfield, setSpellCheckingType:1]; // UITextSpellCheckingTypeNo
-                msg_send_![textfield, setHidden: YES];
                 msg_send_![textfield, setDelegate: textfield_dlg];
-                // to make backspace work - with empty text there is no event on text removal
+                // A hidden view cannot become first responder; keep this field off-screen instead.
+                // UIControlEventEditingChanged reports both marked-text updates and commits.
+                msg_send_![textfield, addTarget:textfield_dlg
+                           action:sel!(textFieldDidChange:)
+                           forControlEvents:1u64 << 17]; // UIControlEventEditingChanged
+                                                         // to make backspace work - with empty text there is no event on text removal
                 msg_send_![textfield, setText: apple_util::str_to_nsstring("x")];
                 msg_send_![view.view, addSubview: textfield];
 
@@ -725,6 +735,7 @@ pub fn define_app_delegate() -> *const Class {
                 view: view.view,
                 view_ctrl: view.view_ctrl,
                 textfield,
+                ime_enabled: false,
                 _textfield_dlg: textfield_dlg,
                 gfx_api: conf.platform.apple_gfx_api,
 
@@ -752,7 +763,17 @@ pub fn define_app_delegate() -> *const Class {
 
                 loop {
                     while let Ok(request) = requests_rx.try_recv() {
-                        s.lock().unwrap().process_request(request);
+                        let (view, message) = {
+                            let mut state = s.lock().unwrap();
+                            let message = state.process_request(request);
+                            if let Some(message) = message {
+                                state.cur_msg = message;
+                            }
+                            (state.view, message)
+                        };
+                        if message.is_some() {
+                            msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
+                        }
                     }
 
                     let block_on_wait = {
@@ -857,58 +878,126 @@ fn define_textfield_dlg() -> *const Class {
     // those 3 callbacks are for resizing the canvas when keyboard is opened
     // which is not currenlty supported by miniquad
     extern "C" fn keyboard_was_shown(_: &Object, _: Sel, _notif: ObjcId) {}
-    extern "C" fn keyboard_will_be_hidden(_: &Object, _: Sel, _notif: ObjcId) {}
+    extern "C" fn keyboard_will_be_hidden(this: &Object, _: Sel, _notif: ObjcId) {
+        let payload = get_window_payload(this);
+        payload.reset_textfield();
+        window::push_ime_event(ImeEvent::End);
+    }
     extern "C" fn keyboard_did_change_frame(_: &Object, _: Sel, _notif: ObjcId) {}
 
+    fn utf16_cursor_to_utf8(text: &str, cursor: usize) -> usize {
+        let mut utf16_offset = 0;
+        for (byte_offset, character) in text.char_indices() {
+            if utf16_offset >= cursor {
+                return byte_offset;
+            }
+            let next = utf16_offset + character.len_utf16();
+            if next > cursor {
+                return byte_offset;
+            }
+            utf16_offset = next;
+        }
+        text.len()
+    }
+
+    fn send_committed_text(text: &str) {
+        for character in text.chars() {
+            match character {
+                '\n' | '\r' => {
+                    send_message(Message::KeyDown {
+                        keycode: KeyCode::Enter,
+                    });
+                    send_message(Message::KeyUp {
+                        keycode: KeyCode::Enter,
+                    });
+                }
+                ' ' => {
+                    send_message(Message::Character {
+                        character: character as u32,
+                    });
+                    send_message(Message::KeyDown {
+                        keycode: KeyCode::Space,
+                    });
+                    send_message(Message::KeyUp {
+                        keycode: KeyCode::Space,
+                    });
+                }
+                character if character >= ' ' => send_message(Message::Character {
+                    character: character as u32,
+                }),
+                _ => {}
+            }
+        }
+    }
+
+    extern "C" fn text_field_did_change(this: &Object, _: Sel, textfield: ObjcId) {
+        unsafe {
+            let payload = get_window_payload(this);
+            if !payload.ime_enabled {
+                return;
+            }
+
+            let marked: ObjcId = msg_send![textfield, markedTextRange];
+            if marked != nil {
+                let value: ObjcId = msg_send![textfield, textInRange: marked];
+                let text = apple_util::nsstring_to_string(value);
+                let selected: ObjcId = msg_send![textfield, selectedTextRange];
+                let cursor = if selected == nil {
+                    None
+                } else {
+                    let marked_start: ObjcId = msg_send![marked, start];
+                    let selected_start: ObjcId = msg_send![selected, start];
+                    let cursor: i64 = msg_send![textfield,
+                        offsetFromPosition:marked_start toPosition:selected_start];
+                    (cursor >= 0).then(|| utf16_cursor_to_utf8(&text, cursor as usize))
+                };
+                if text.is_empty() {
+                    window::push_ime_event(ImeEvent::End);
+                } else {
+                    window::push_ime_event(ImeEvent::Preedit { text, cursor });
+                }
+                return;
+            }
+
+            let value: ObjcId = msg_send![textfield, text];
+            let value = apple_util::nsstring_to_string(value);
+            let committed = value.strip_prefix('x').unwrap_or(&value);
+            send_committed_text(committed);
+            payload.reset_textfield();
+            window::push_ime_event(ImeEvent::End);
+        }
+    }
+
     extern "C" fn should_change_characters_in_range(
-        _: &Object,
+        this: &Object,
         _: Sel,
-        _textfield: ObjcId,
+        textfield: ObjcId,
         _range: NSRange,
         string: ObjcId,
     ) -> BOOL {
         unsafe {
+            if !get_window_payload(this).ime_enabled {
+                return NO;
+            }
             let len: u64 = msg_send![string, length];
-            if len > 0 {
-                for i in 0..len {
-                    let c: u16 = msg_send![string, characterAtIndex: i];
-
-                    match c {
-                        c if c >= 32 && !(0xD800..=0xDFFF).contains(&c) => {
-                            send_message(Message::Character {
-                                character: c as u32,
-                            })
-                        }
-                        10 => {
-                            send_message(Message::KeyDown {
-                                keycode: crate::event::KeyCode::Enter,
-                            });
-                            send_message(Message::KeyUp {
-                                keycode: crate::event::KeyCode::Enter,
-                            });
-                        }
-                        32 => {
-                            send_message(Message::Character {
-                                character: ' ' as u32,
-                            });
-                            send_message(Message::KeyDown {
-                                keycode: crate::event::KeyCode::Space,
-                            });
-                            send_message(Message::KeyUp {
-                                keycode: crate::event::KeyCode::Space,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-            } else {
+            let marked: ObjcId = msg_send![textfield, markedTextRange];
+            if len == 0 && marked == nil {
                 send_message(Message::KeyDown {
-                    keycode: crate::event::KeyCode::Backspace,
+                    keycode: KeyCode::Backspace,
                 });
                 send_message(Message::KeyUp {
-                    keycode: crate::event::KeyCode::Backspace,
+                    keycode: KeyCode::Backspace,
                 });
+                return NO;
             }
+        }
+        YES
+    }
+
+    extern "C" fn text_field_should_return(this: &Object, _: Sel, _: ObjcId) -> BOOL {
+        if get_window_payload(this).ime_enabled {
+            send_committed_text("\n");
+            window::push_ime_event(ImeEvent::End);
         }
         NO
     }
@@ -927,9 +1016,17 @@ fn define_textfield_dlg() -> *const Class {
             keyboard_did_change_frame as extern "C" fn(&Object, Sel, ObjcId),
         );
         decl.add_method(
+            sel!(textFieldDidChange:),
+            text_field_did_change as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
             sel!(textField: shouldChangeCharactersInRange: replacementString:),
             should_change_characters_in_range
                 as extern "C" fn(&Object, Sel, ObjcId, NSRange, ObjcId) -> BOOL,
+        );
+        decl.add_method(
+            sel!(textFieldShouldReturn:),
+            text_field_should_return as extern "C" fn(&Object, Sel, ObjcId) -> BOOL,
         );
     }
     decl.add_ivar::<*mut c_void>("display_ptr");

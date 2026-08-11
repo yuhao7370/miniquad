@@ -19,6 +19,7 @@ import android.view.SurfaceHolder;
 import android.view.MotionEvent;
 import android.view.KeyEvent;
 import android.view.inputmethod.InputMethodManager;
+import android.view.inputmethod.BaseInputConnection;
 
 import android.content.Context;
 import android.content.Intent;
@@ -30,6 +31,7 @@ import android.graphics.Color;
 import android.graphics.Insets;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.EditorInfo;
+import android.text.InputType;
 import android.widget.LinearLayout;
 
 import quad_native.QuadNative;
@@ -48,6 +50,9 @@ class QuadSurface
         View.OnKeyListener,
         SurfaceHolder.Callback {
 
+    private volatile boolean imeEnabled;
+    private final BaseInputConnection imeConnection;
+
     public QuadSurface(Context context){
         super(context);
         getHolder().addCallback(this);
@@ -57,6 +62,53 @@ class QuadSurface
         requestFocus();
         setOnTouchListener(this);
         setOnKeyListener(this);
+
+        imeConnection = new BaseInputConnection(this, false) {
+            private boolean composing;
+
+            @Override
+            public boolean setComposingText(CharSequence text, int newCursorPosition) {
+                if (!imeEnabled) {
+                    return false;
+                }
+                String value = text == null ? "" : text.toString();
+                int cursor = newCursorPosition > 0
+                    ? value.length() + newCursorPosition - 1
+                    : newCursorPosition;
+                cursor = Math.max(0, Math.min(value.length(), cursor));
+                composing = !value.isEmpty();
+                QuadNative.surfaceOnImePreedit(value, cursor);
+                return true;
+            }
+
+            @Override
+            public boolean commitText(CharSequence text, int newCursorPosition) {
+                if (!imeEnabled) {
+                    return false;
+                }
+                composing = false;
+                QuadNative.surfaceOnImeCommit(text == null ? "" : text.toString());
+                return true;
+            }
+
+            @Override
+            public boolean finishComposingText() {
+                if (composing) {
+                    QuadNative.surfaceOnImeEnd();
+                }
+                composing = false;
+                return true;
+            }
+
+            @Override
+            public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+                if (composing) {
+                    QuadNative.surfaceOnImeEnd();
+                    composing = false;
+                }
+                return super.deleteSurroundingText(beforeLength, afterLength);
+            }
+        };
     }
 
     @Override
@@ -193,9 +245,23 @@ class QuadSurface
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
         //% QUAD_SURFACE_ON_CREATE_INPUT_CONNECTION
 
-        InputConnection connection = super.onCreateInputConnection(outAttrs);
-        outAttrs.imeOptions |= EditorInfo.IME_FLAG_NO_FULLSCREEN;
-        return connection;
+        if (!imeEnabled) {
+            return null;
+        }
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+        outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE
+            | EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            | EditorInfo.IME_FLAG_NO_FULLSCREEN;
+        return imeConnection;
+    }
+
+    @Override
+    public boolean onCheckIsTextEditor() {
+        return imeEnabled;
+    }
+
+    public void setImeEnabled(boolean enabled) {
+        imeEnabled = enabled;
     }
 
     public Surface getNativeSurface() {
@@ -367,6 +433,17 @@ public class MainActivity extends Activity {
                         InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
                         imm.hideSoftInputFromWindow(view.getWindowToken(),0);
                     }
+                }
+            });
+    }
+
+    public void setImeEnabled(final boolean enabled) {
+        runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    view.setImeEnabled(enabled);
+                    InputMethodManager imm = (InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
+                    imm.restartInput(view);
                 }
             });
     }

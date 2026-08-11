@@ -117,6 +117,12 @@ fn native_display() -> &'static Mutex<native::NativeDisplayData> {
 /// Window and associated to window rendering context related functions.
 /// in macroquad <= 0.3, it was ctx.screen_size(). Now it is window::screen_size()
 pub mod window {
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum ImeEvent {
+        Preedit { text: String, cursor: Option<usize> },
+        End,
+    }
+
     #[derive(Clone, Copy, Debug)]
     pub struct TouchEvent {
         pub phase: crate::TouchPhase,
@@ -165,7 +171,9 @@ pub mod window {
         (d.screen_width as f32, d.screen_height as f32)
     }
 
-    /// Returns the Unix timestamp at which the active touch began.
+    /// Returns the timestamp at which the active touch began.
+    ///
+    /// Use [`touch_time_now`] to compare it with the current time.
     pub fn touch_start_time(id: u64) -> Option<f64> {
         native_display()
             .lock()
@@ -175,12 +183,49 @@ pub mod window {
             .copied()
     }
 
+    /// Returns the current time in the same clock domain as touch timestamps.
+    #[cfg(target_os = "ios")]
+    pub fn touch_time_now() -> f64 {
+        crate::native::ios::touch_time_now()
+    }
+
+    /// Returns the current time in the same clock domain as touch timestamps.
+    #[cfg(not(target_os = "ios"))]
+    pub fn touch_time_now() -> f64 {
+        crate::date::now()
+    }
+
     pub fn take_touch_starts() -> Vec<TouchStart> {
         std::mem::take(&mut native_display().lock().unwrap().pending_touch_starts)
     }
 
     pub fn take_touch_events() -> Vec<TouchEvent> {
         std::mem::take(&mut native_display().lock().unwrap().pending_touch_events)
+    }
+
+    pub fn take_ime_events() -> Vec<ImeEvent> {
+        std::mem::take(&mut native_display().lock().unwrap().pending_ime_events)
+    }
+
+    pub(crate) fn push_ime_event(event: ImeEvent) {
+        let event = match event {
+            ImeEvent::Preedit { text, cursor } if !text.is_empty() => {
+                let cursor = cursor.map(|cursor| {
+                    let mut cursor = cursor.min(text.len());
+                    while !text.is_char_boundary(cursor) {
+                        cursor -= 1;
+                    }
+                    cursor
+                });
+                ImeEvent::Preedit { text, cursor }
+            }
+            ImeEvent::Preedit { .. } | ImeEvent::End => ImeEvent::End,
+        };
+        native_display()
+            .lock()
+            .unwrap()
+            .pending_ime_events
+            .push(event);
     }
 
     /// Monotonically increasing generation for iOS application resumes.
@@ -429,7 +474,6 @@ pub mod window {
     /// This should be called when the text cursor moves to keep the IME
     /// candidate window near the insertion point.
     pub fn set_ime_position(x: i32, y: i32) {
-        let d = native_display().lock().unwrap();
         #[cfg(target_os = "android")]
         {
             let _ = (x, y); // IME position not applicable on Android
@@ -437,6 +481,7 @@ pub mod window {
 
         #[cfg(not(target_os = "android"))]
         {
+            let d = native_display().lock().unwrap();
             d.native_requests
                 .send(native::Request::SetImePosition { x, y })
                 .unwrap();
@@ -454,7 +499,7 @@ pub mod window {
         let d = native_display().lock().unwrap();
         #[cfg(target_os = "android")]
         {
-            let _ = enabled; // IME control not applicable on Android
+            (d.native_requests)(native::Request::SetImeEnabled(enabled));
         }
 
         #[cfg(not(target_os = "android"))]

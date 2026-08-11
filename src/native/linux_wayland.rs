@@ -19,6 +19,7 @@ use libxkbcommon::*;
 use crate::{
     event::{EventHandler, KeyCode, KeyMods, MouseButton},
     native::{egl, NativeDisplayData, Request},
+    window::{self, ImeEvent},
 };
 
 use core::time::Duration;
@@ -45,6 +46,13 @@ struct WaylandPayload {
     viewporter: *mut extensions::viewporter::wp_viewporter,
     shm: *mut wl_shm,
     seat: *mut wl_seat,
+    text_input_manager: *mut extensions::text_input::zwp_text_input_manager_v3,
+    text_input: *mut extensions::text_input::zwp_text_input_v3,
+    text_input_enabled: bool,
+    text_input_entered: bool,
+    text_input_position: (i32, i32),
+    pending_preedit: Option<(String, Option<usize>)>,
+    pending_commit: Option<String>,
     data_device_manager: *mut wl_data_device_manager,
     data_device: *mut wl_data_device,
     xkb_context: *mut xkb_context,
@@ -67,6 +75,124 @@ struct WaylandPayload {
 }
 
 impl WaylandPayload {
+    fn text_input_active(&self) -> bool {
+        self.text_input_enabled && self.text_input_entered && !self.text_input.is_null()
+    }
+
+    unsafe fn init_text_input(&mut self) {
+        if !self.text_input.is_null() || self.text_input_manager.is_null() || self.seat.is_null() {
+            return;
+        }
+        self.text_input = wl_request_constructor!(
+            self.client,
+            self.text_input_manager,
+            extensions::text_input::zwp_text_input_manager_v3::get_text_input,
+            &extensions::text_input::zwp_text_input_v3_interface,
+            self.seat
+        );
+        if self.text_input.is_null() {
+            return;
+        }
+        TEXT_INPUT_LISTENER.enter = text_input_handle_enter;
+        TEXT_INPUT_LISTENER.leave = text_input_handle_leave;
+        TEXT_INPUT_LISTENER.preedit_string = text_input_handle_preedit_string;
+        TEXT_INPUT_LISTENER.commit_string = text_input_handle_commit_string;
+        TEXT_INPUT_LISTENER.delete_surrounding_text = text_input_handle_delete_surrounding_text;
+        TEXT_INPUT_LISTENER.done = text_input_handle_done;
+        (self.client.wl_proxy_add_listener)(
+            self.text_input as _,
+            &TEXT_INPUT_LISTENER as *const _ as _,
+            self as *mut _ as _,
+        );
+    }
+
+    unsafe fn commit_text_input_state(&mut self) {
+        wl_request!(
+            self.client,
+            self.text_input,
+            extensions::text_input::zwp_text_input_v3::commit
+        );
+    }
+
+    unsafe fn send_text_input_position(&mut self) {
+        wl_request!(
+            self.client,
+            self.text_input,
+            extensions::text_input::zwp_text_input_v3::set_cursor_rectangle,
+            self.text_input_position.0,
+            self.text_input_position.1,
+            1,
+            1
+        );
+    }
+
+    unsafe fn enable_text_input(&mut self) {
+        if !self.text_input_active() {
+            return;
+        }
+        wl_request!(
+            self.client,
+            self.text_input,
+            extensions::text_input::zwp_text_input_v3::enable
+        );
+        self.send_text_input_position();
+        self.commit_text_input_state();
+    }
+
+    unsafe fn set_text_input_enabled(&mut self, enabled: bool) {
+        if self.text_input_enabled == enabled {
+            return;
+        }
+        self.text_input_enabled = enabled;
+        if enabled {
+            self.enable_text_input();
+            return;
+        }
+        if self.text_input_entered && !self.text_input.is_null() {
+            wl_request!(
+                self.client,
+                self.text_input,
+                extensions::text_input::zwp_text_input_v3::disable
+            );
+            self.commit_text_input_state();
+        }
+        self.pending_preedit = None;
+        self.pending_commit = None;
+        window::push_ime_event(ImeEvent::End);
+    }
+
+    unsafe fn set_text_input_position(&mut self, x: i32, y: i32) {
+        if self.text_input_position == (x, y) {
+            return;
+        }
+        self.text_input_position = (x, y);
+        if self.text_input_active() {
+            self.send_text_input_position();
+            self.commit_text_input_state();
+        }
+    }
+
+    unsafe fn destroy_text_input(&mut self) {
+        if !self.text_input.is_null() {
+            wl_request!(
+                self.client,
+                self.text_input,
+                extensions::text_input::zwp_text_input_v3::destroy
+            );
+            (self.client.wl_proxy_destroy)(self.text_input as _);
+            self.text_input = std::ptr::null_mut();
+        }
+        if !self.text_input_manager.is_null() {
+            wl_request!(
+                self.client,
+                self.text_input_manager,
+                extensions::text_input::zwp_text_input_manager_v3::destroy
+            );
+            (self.client.wl_proxy_destroy)(self.text_input_manager as _);
+            self.text_input_manager = std::ptr::null_mut();
+        }
+    }
+
     /// Poll new events, `blocking` specifies whether it should block until a new event is
     /// available
     // needs to combine both the Wayland events and the key repeat events
@@ -108,11 +234,13 @@ impl WaylandPayload {
                     ),
                     n_bits as _
                 );
+                let emit_char = !self.text_input_active();
                 for _ in 0..count[0] {
                     self.keyboard_context.generate_key_repeat_events(
                         &mut self.xkb,
                         &self.keymap,
                         self.xkb_state,
+                        emit_char,
                         &mut self.events,
                     );
                 }
@@ -278,10 +406,14 @@ impl KeyboardContext {
         libxkb: &mut LibXkbCommon,
         keymap: &XkbKeymap,
         xkb_state: *mut xkb_state,
+        emit_char: bool,
         events: &mut Vec<WaylandEvent>,
     ) {
         if let Some(key) = self.repeated_key {
-            self.generate_key_events(libxkb, keymap, xkb_state, key, true, events)
+            self.generate_key_events(libxkb, keymap, xkb_state, key, true, events);
+            if !emit_char && matches!(events.last(), Some(WaylandEvent::Char(..))) {
+                events.pop();
+            }
         }
     }
     unsafe fn generate_key_events(
@@ -460,6 +592,8 @@ static mut XDG_WM_BASE_LISTENER: extensions::xdg_shell::xdg_wm_base_listener =
     extensions::xdg_shell::xdg_wm_base_listener::dummy();
 static mut RELATIVE_POINTER_LISTENER: extensions::cursor::zwp_relative_pointer_v1_listener =
     extensions::cursor::zwp_relative_pointer_v1_listener::dummy();
+static mut TEXT_INPUT_LISTENER: extensions::text_input::zwp_text_input_v3_listener =
+    extensions::text_input::zwp_text_input_v3_listener::dummy();
 
 unsafe extern "C" fn seat_handle_capabilities(
     data: *mut std::ffi::c_void,
@@ -544,6 +678,115 @@ enum WaylandEvent {
     WindowRestored,
 }
 
+unsafe extern "C" fn text_input_handle_enter(
+    data: *mut core::ffi::c_void,
+    _text_input: *mut extensions::text_input::zwp_text_input_v3,
+    surface: *mut wl_surface,
+) {
+    let display: &mut WaylandPayload = &mut *(data as *mut _);
+    display.text_input_entered = surface == display.surface;
+    if display.text_input_enabled && display.text_input_entered {
+        display.enable_text_input();
+    }
+}
+
+unsafe extern "C" fn text_input_handle_leave(
+    data: *mut core::ffi::c_void,
+    _text_input: *mut extensions::text_input::zwp_text_input_v3,
+    surface: *mut wl_surface,
+) {
+    let display: &mut WaylandPayload = &mut *(data as *mut _);
+    if surface != display.surface {
+        return;
+    }
+    if !display.text_input.is_null() {
+        wl_request!(
+            display.client,
+            display.text_input,
+            extensions::text_input::zwp_text_input_v3::disable
+        );
+        display.commit_text_input_state();
+    }
+    display.text_input_entered = false;
+    display.pending_preedit = None;
+    display.pending_commit = None;
+    window::push_ime_event(ImeEvent::End);
+}
+
+unsafe extern "C" fn text_input_handle_preedit_string(
+    data: *mut core::ffi::c_void,
+    _text_input: *mut extensions::text_input::zwp_text_input_v3,
+    text: *const core::ffi::c_char,
+    cursor_begin: core::ffi::c_int,
+    cursor_end: core::ffi::c_int,
+) {
+    let display: &mut WaylandPayload = &mut *(data as *mut _);
+    let text = if text.is_null() {
+        String::new()
+    } else {
+        core::ffi::CStr::from_ptr(text)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let cursor = [cursor_end, cursor_begin]
+        .iter()
+        .copied()
+        .find_map(|cursor| {
+            (cursor >= 0)
+                .then_some(cursor as usize)
+                .filter(|cursor| text.is_char_boundary(*cursor))
+        });
+    display.pending_preedit = Some((text, cursor));
+    display.update_requested = true;
+}
+
+unsafe extern "C" fn text_input_handle_commit_string(
+    data: *mut core::ffi::c_void,
+    _text_input: *mut extensions::text_input::zwp_text_input_v3,
+    text: *const core::ffi::c_char,
+) {
+    let display: &mut WaylandPayload = &mut *(data as *mut _);
+    display.pending_preedit = None;
+    display.pending_commit = Some(if text.is_null() {
+        String::new()
+    } else {
+        core::ffi::CStr::from_ptr(text)
+            .to_string_lossy()
+            .into_owned()
+    });
+    display.update_requested = true;
+}
+
+unsafe extern "C" fn text_input_handle_delete_surrounding_text(
+    _data: *mut core::ffi::c_void,
+    _text_input: *mut extensions::text_input::zwp_text_input_v3,
+    _before_length: core::ffi::c_uint,
+    _after_length: core::ffi::c_uint,
+) {
+}
+
+unsafe extern "C" fn text_input_handle_done(
+    data: *mut core::ffi::c_void,
+    _text_input: *mut extensions::text_input::zwp_text_input_v3,
+    _serial: core::ffi::c_uint,
+) {
+    let display: &mut WaylandPayload = &mut *(data as *mut _);
+    if let Some(commit) = display.pending_commit.take() {
+        display.events.extend(
+            commit
+                .chars()
+                .map(|character| WaylandEvent::Char(character, KeyMods::default(), false)),
+        );
+    }
+    match display.pending_preedit.take() {
+        Some((text, cursor)) if !text.is_empty() => {
+            window::push_ime_event(ImeEvent::Preedit { text, cursor });
+        }
+        _ => window::push_ime_event(ImeEvent::End),
+    }
+    display.update_requested = true;
+}
+
 unsafe extern "C" fn keyboard_handle_keymap(
     data: *mut ::core::ffi::c_void,
     _wl_keyboard: *mut wl_keyboard,
@@ -608,6 +851,7 @@ unsafe extern "C" fn keyboard_handle_key(
     state: wl_keyboard_key_state,
 ) {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
+    let emit_char = !display.text_input_active();
     let libxkb = &mut display.xkb;
     let xkb_keymap = display.keymap.xkb_keymap;
     let xkb_state = display.xkb_state;
@@ -635,6 +879,9 @@ unsafe extern "C" fn keyboard_handle_key(
                 repeat,
                 &mut display.events,
             );
+            if !emit_char && matches!(display.events.last(), Some(WaylandEvent::Char(..))) {
+                display.events.pop();
+            }
         }
         _ => {
             eprintln!("Unknown wl_keyboard::key_state");
@@ -979,6 +1226,15 @@ unsafe extern "C" fn registry_add_object(
                 1,
             ) as _;
         }
+        "zwp_text_input_manager_v3" => {
+            display.text_input_manager = display.client.wl_registry_bind(
+                registry,
+                name,
+                &extensions::text_input::zwp_text_input_manager_v3_interface,
+                1.min(version),
+            ) as _;
+            display.init_text_input();
+        }
         "wl_shm" => {
             display.shm =
                 display
@@ -1001,6 +1257,7 @@ unsafe extern "C" fn registry_add_object(
                 &SEAT_LISTENER as *const _ as _,
                 data,
             );
+            display.init_text_input();
         }
         "wl_data_device_manager" => {
             display.data_device_manager = display.client.wl_registry_bind(
@@ -1086,6 +1343,13 @@ where
             viewporter: std::ptr::null_mut(),
             shm: std::ptr::null_mut(),
             seat: std::ptr::null_mut(),
+            text_input_manager: std::ptr::null_mut(),
+            text_input: std::ptr::null_mut(),
+            text_input_enabled: false,
+            text_input_entered: false,
+            text_input_position: (0, 0),
+            pending_preedit: None,
+            pending_commit: None,
             data_device_manager: std::ptr::null_mut(),
             data_device: std::ptr::null_mut(),
             xkb_context,
@@ -1232,6 +1496,12 @@ where
                             .pointer_context
                             .set_cursor(&mut display.client, cursor_visible.then_some(cursor_icon));
                     }
+                    Request::SetImePosition { x, y } => {
+                        display.set_text_input_position(x, y);
+                    }
+                    Request::SetImeEnabled(enabled) => {
+                        display.set_text_input_enabled(enabled);
+                    }
                     // TODO: implement the other events
                     _ => (),
                 }
@@ -1312,6 +1582,7 @@ where
                 (libegl.eglSwapBuffers)(egl_display, egl_surface);
             }
         }
+        display.destroy_text_input();
     }
 
     Some(())

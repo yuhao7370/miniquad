@@ -480,6 +480,17 @@ unsafe impl Encode for NSRange {
     }
 }
 
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct NSRangePointer(pub *mut NSRange);
+
+unsafe impl Encode for NSRangePointer {
+    fn encode() -> Encoding {
+        let encoding = format!("^{}", NSRange::encode().as_str());
+        unsafe { Encoding::from_str(&encoding) }
+    }
+}
+
 pub trait NSMutableAttributedString: Sized {
     unsafe fn alloc(_: Self) -> ObjcId {
         msg_send![class!(NSMutableAttributedString), alloc]
