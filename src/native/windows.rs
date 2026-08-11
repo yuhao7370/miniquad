@@ -17,7 +17,7 @@ use winapi::{
         windowsx::{GET_X_LPARAM, GET_Y_LPARAM},
     },
     um::{
-        imm::{HIMC, ImmGetContext, ImmReleaseContext},
+        imm::{ImmGetContext, ImmReleaseContext, HIMC},
         libloaderapi::{GetModuleHandleW, GetProcAddress},
         shellapi::{DragAcceptFiles, DragQueryFileW, HDROP},
         shellscalingapi::*,
@@ -79,7 +79,12 @@ struct CANDIDATEFORM {
 // Link to imm32.dll for IME support
 #[link(name = "imm32")]
 extern "system" {
-    fn ImmGetCompositionStringW(himc: HIMC, index: DWORD, buf: *mut std::ffi::c_void, len: DWORD) -> i32;
+    fn ImmGetCompositionStringW(
+        himc: HIMC,
+        index: DWORD,
+        buf: *mut std::ffi::c_void,
+        len: DWORD,
+    ) -> i32;
     fn ImmAssociateContextEx(hwnd: HWND, himc: HIMC, flags: DWORD) -> i32;
     fn ImmAssociateContext(hwnd: HWND, himc: HIMC) -> HIMC;
     fn ImmCreateContext() -> HIMC;
@@ -96,12 +101,8 @@ unsafe fn composition_utf16(himc: HIMC, index: DWORD) -> Vec<u16> {
     }
 
     let mut buffer = vec![0; byte_len as usize / 2];
-    let actual_len = ImmGetCompositionStringW(
-        himc,
-        index,
-        buffer.as_mut_ptr().cast(),
-        byte_len as DWORD,
-    );
+    let actual_len =
+        ImmGetCompositionStringW(himc, index, buffer.as_mut_ptr().cast(), byte_len as DWORD);
     if actual_len <= 0 {
         return Vec::new();
     }
@@ -200,7 +201,7 @@ impl WindowsDisplay {
             ImmReleaseContext(self.wnd, himc);
         }
     }
-    
+
     /// Enable or disable IME for the window.
     /// When disabled, the IME will not process keyboard input, useful for game controls.
     fn set_ime_enabled(&mut self, enabled: bool) {
@@ -217,7 +218,7 @@ impl WindowsDisplay {
             }
         }
     }
-    
+
     fn set_mouse_cursor(&mut self, cursor_icon: CursorIcon) {
         let cursor_name = match cursor_icon {
             CursorIcon::Default => IDC_ARROW,
@@ -639,15 +640,11 @@ unsafe extern "system" fn win32_wndproc(
 
                 if (flags & GCS_COMPSTR) != 0 {
                     let composition = composition_utf16(himc, GCS_COMPSTR);
-                    let cursor = ImmGetCompositionStringW(
-                        himc,
-                        GCS_CURSORPOS,
-                        std::ptr::null_mut(),
-                        0,
-                    );
+                    let cursor =
+                        ImmGetCompositionStringW(himc, GCS_CURSORPOS, std::ptr::null_mut(), 0);
                     let text = String::from_utf16_lossy(&composition);
-                    let cursor = (cursor >= 0)
-                        .then(|| utf16_cursor_to_utf8(&composition, cursor as usize));
+                    let cursor =
+                        (cursor >= 0).then(|| utf16_cursor_to_utf8(&composition, cursor as usize));
                     window::push_ime_event(ImeEvent::Preedit { text, cursor });
                 } else if (flags & GCS_RESULTSTR) != 0 {
                     window::push_ime_event(ImeEvent::End);
@@ -659,41 +656,54 @@ unsafe extern "system" fn win32_wndproc(
         }
         WM_IME_SETCONTEXT => {
             let user_disabled = IME_USER_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
-            
+
             // If user explicitly disabled IME, don't auto-restore
             if user_disabled {
                 return 0;
             }
-            
+
             // Must pass to DefWindowProc to enable IME properly
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_IME_STARTCOMPOSITION => {
             // Offset for candidate window below composition position
             const CANDIDATE_WINDOW_Y_OFFSET: i32 = 20;
-            
+
             // Set candidate window position when IME starts composition
             let himc = ImmGetContext(hwnd);
             if !himc.is_null() {
                 let mut pt: POINT = std::mem::zeroed();
                 GetCaretPos(&mut pt);
-                
+
                 let comp_form = COMPOSITIONFORM {
                     dwStyle: CFS_POINT,
                     ptCurrentPos: pt,
-                    rcArea: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+                    rcArea: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
                 };
                 ImmSetCompositionWindow(himc, &comp_form);
-                
+
                 // Set candidate window position (most IMEs only use index 0)
                 let cand_form = CANDIDATEFORM {
                     dwIndex: 0,
                     dwStyle: CFS_CANDIDATEPOS,
-                    ptCurrentPos: POINT { x: pt.x, y: pt.y + CANDIDATE_WINDOW_Y_OFFSET },
-                    rcArea: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+                    ptCurrentPos: POINT {
+                        x: pt.x,
+                        y: pt.y + CANDIDATE_WINDOW_Y_OFFSET,
+                    },
+                    rcArea: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
                 };
                 ImmSetCandidateWindow(himc, &cand_form);
-                
+
                 ImmReleaseContext(hwnd, himc);
             }
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
@@ -704,20 +714,21 @@ unsafe extern "system" fn win32_wndproc(
         }
         WM_IME_NOTIFY => {
             const IMN_SETOPENSTATUS: WPARAM = 0x0008;
-            
+
             // Re-enable IME if it was unexpectedly closed (unless user disabled it)
             if wparam == IMN_SETOPENSTATUS {
                 let himc = ImmGetContext(hwnd);
                 if !himc.is_null() {
                     let open_status = ImmGetOpenStatus(himc);
-                    let user_disabled = IME_USER_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
+                    let user_disabled =
+                        IME_USER_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
                     if open_status == 0 && !user_disabled {
                         ImmSetOpenStatus(himc, 1);
                     }
                     ImmReleaseContext(hwnd, himc);
                 }
             }
-            
+
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_INPUTLANGCHANGEREQUEST | WM_INPUTLANGCHANGE => {
@@ -803,11 +814,11 @@ unsafe extern "system" fn win32_wndproc(
         }
         WM_SETFOCUS => {
             let user_disabled = IME_USER_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
-            
+
             // Ensure IME context is available when window gains focus
             if !user_disabled {
                 let himc = ImmGetContext(hwnd);
-                
+
                 if himc.is_null() {
                     // Create new IME context if none exists
                     let new_himc = ImmCreateContext();
@@ -827,7 +838,7 @@ unsafe extern "system" fn win32_wndproc(
                     ImmReleaseContext(hwnd, himc);
                 }
             }
-            
+
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_KILLFOCUS => {
@@ -1012,14 +1023,14 @@ unsafe fn create_window(
 unsafe fn create_msg_window() -> (HWND, HDC) {
     // Use a separate window class to avoid interfering with main window's IME
     let class_name = "MINIQUADMSGWND\0".encode_utf16().collect::<Vec<u16>>();
-    
+
     let mut wndclassw: WNDCLASSW = std::mem::zeroed();
     wndclassw.style = 0;
     wndclassw.lpfnWndProc = Some(DefWindowProcW);
     wndclassw.hInstance = GetModuleHandleW(NULL as _);
     wndclassw.lpszClassName = class_name.as_ptr() as _;
     RegisterClassW(&wndclassw);
-    
+
     let window_name = "miniquad message window\0"
         .encode_utf16()
         .collect::<Vec<u16>>();
@@ -1041,10 +1052,10 @@ unsafe fn create_msg_window() -> (HWND, HDC) {
         !msg_hwnd.is_null(),
         "Win32: failed to create helper window!"
     );
-    
+
     // Disable IME for message window to avoid interfering with main window
     ImmAssociateContextEx(msg_hwnd, std::ptr::null_mut(), IACE_CHILDREN);
-    
+
     ShowWindow(msg_hwnd, SW_HIDE);
     let mut msg = std::mem::zeroed();
     while PeekMessageW(&mut msg as _, msg_hwnd, 0, 0, PM_REMOVE) != 0 {
