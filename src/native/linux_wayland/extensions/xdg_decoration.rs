@@ -10,7 +10,7 @@ use super::{
 pub const ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE: u32 = 1;
 pub const ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE: u32 = 2;
 
-#[rustfmt::skip] 
+#[rustfmt::skip]
 wayland_interface!(
     zxdg_decoration_manager_v1_interface,
     zxdg_decoration_manager_v1,
@@ -22,7 +22,7 @@ wayland_interface!(
     []
 );
 
-#[rustfmt::skip] 
+#[rustfmt::skip]
 wayland_interface!(
     zxdg_toplevel_decoration_v1_interface,
     zxdg_toplevel_decoration_v1,

@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::mpsc;
 
 #[derive(Default)]
@@ -17,13 +16,13 @@ pub(crate) struct NativeDisplayData {
     pub high_dpi: bool,
     pub quit_requested: bool,
     pub quit_ordered: bool,
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub native_requests: Box<dyn Fn(Request) + Send>,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub native_requests: mpsc::Sender<Request>,
     pub clipboard: Box<dyn Clipboard>,
     pub dropped_files: DroppedFiles,
-    pub touch_start_times: HashMap<u64, f64>,
+    pub touch_start_times: std::collections::HashMap<u64, f64>,
     pub pending_touch_starts: Vec<crate::window::TouchStart>,
     pub pending_touch_events: Vec<crate::window::TouchEvent>,
     pub pending_ime_events: Vec<crate::window::ImeEvent>,
@@ -47,8 +46,12 @@ impl NativeDisplayData {
     pub fn new(
         screen_width: i32,
         screen_height: i32,
-        #[cfg(target_os = "android")] native_requests: Box<dyn Fn(Request) + Send>,
-        #[cfg(not(target_os = "android"))] native_requests: mpsc::Sender<Request>,
+        #[cfg(any(target_os = "android", target_os = "ios"))] native_requests: Box<
+            dyn Fn(Request) + Send,
+        >,
+        #[cfg(not(any(target_os = "android", target_os = "ios")))] native_requests: mpsc::Sender<
+            Request,
+        >,
         clipboard: Box<dyn Clipboard>,
     ) -> NativeDisplayData {
         NativeDisplayData {

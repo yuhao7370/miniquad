@@ -20,7 +20,7 @@ pub mod ndk_utils;
 #[no_mangle]
 pub unsafe extern "C" fn JNI_OnLoad(
     vm: *mut ndk_sys::JavaVM,
-    _: std::ffi::c_void,
+    _reserved: *mut std::ffi::c_void,
 ) -> ndk_sys::jint {
     VM = vm as *mut _ as _;
 
@@ -29,6 +29,19 @@ pub unsafe extern "C" fn JNI_OnLoad(
 
 extern "C" {
     fn quad_main();
+    fn SwappyGL_init(env: *mut ndk_sys::JNIEnv, activity: ndk_sys::jobject) -> bool;
+    fn SwappyGL_isEnabled() -> bool;
+    fn SwappyGL_destroy();
+    fn SwappyGL_setWindow(window: *mut ndk_sys::ANativeWindow) -> bool;
+    fn SwappyGL_swap(display: egl::EGLDisplay, surface: egl::EGLSurface) -> bool;
+    fn SwappyGL_setSwapIntervalNS(swap_ns: u64);
+    fn SwappyGL_setAutoSwapInterval(enabled: bool);
+    fn SwappyGL_setAutoPipelineMode(enabled: bool);
+}
+
+fn swap_interval_ns(fps: u16) -> u64 {
+    let fps = u64::from(fps.max(1));
+    (1_000_000_000 + fps - 1) / fps
 }
 
 /// Short recap on how miniquad on Android works
@@ -177,28 +190,37 @@ struct MainThreadState {
     fullscreen: bool,
     update_requested: bool,
     keymods: KeyMods,
+    swappy_enabled: bool,
+    swappy_initialized: bool,
+    swappy_window_valid: bool,
+    frame_pacing_applied: Option<crate::FramePacing>,
+    swappy_swap_warning_logged: bool,
+    paused: bool,
 }
 
 impl MainThreadState {
     unsafe fn destroy_surface(&mut self) {
-        (self.libegl.eglMakeCurrent)(
-            self.egl_display,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        (self.libegl.eglDestroySurface)(self.egl_display, self.surface);
-        self.surface = std::ptr::null_mut();
+        self.swappy_window_valid = false;
+        self.frame_pacing_applied = None;
+        if !self.surface.is_null() {
+            (self.libegl.eglMakeCurrent)(
+                self.egl_display,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            (self.libegl.eglDestroySurface)(self.egl_display, self.surface);
+            self.surface = std::ptr::null_mut();
+        }
+        if !self.window.is_null() {
+            ndk_sys::ANativeWindow_release(self.window);
+            self.window = std::ptr::null_mut();
+        }
     }
 
     unsafe fn update_surface(&mut self, window: *mut ndk_sys::ANativeWindow) {
-        if !self.window.is_null() {
-            ndk_sys::ANativeWindow_release(self.window);
-        }
+        self.destroy_surface();
         self.window = window;
-        if self.surface.is_null() == false {
-            self.destroy_surface();
-        }
 
         self.surface = (self.libegl.eglCreateWindowSurface)(
             self.egl_display,
@@ -207,7 +229,10 @@ impl MainThreadState {
             std::ptr::null_mut(),
         );
 
-        assert!(!self.surface.is_null());
+        if self.surface.is_null() {
+            self.destroy_surface();
+            panic!("Android EGL window surface creation failed");
+        }
 
         let res = (self.libegl.eglMakeCurrent)(
             self.egl_display,
@@ -216,7 +241,13 @@ impl MainThreadState {
             self.egl_context,
         );
 
-        assert!(res != 0);
+        if res == 0 {
+            self.destroy_surface();
+            panic!("Android EGL window surface activation failed");
+        }
+
+        self.swappy_window_valid = self.swappy_enabled && SwappyGL_setWindow(self.window);
+        self.frame_pacing_applied = None;
     }
 
     fn process_message(&mut self, msg: Message) {
@@ -312,8 +343,12 @@ impl MainThreadState {
                 }
                 self.event_handler.key_up_event(keycode, self.keymods);
             }
-            Message::Pause => self.event_handler.window_minimized_event(),
+            Message::Pause => {
+                self.paused = true;
+                self.event_handler.window_minimized_event()
+            }
             Message::Resume => {
+                self.paused = false;
                 if self.fullscreen {
                     unsafe {
                         let env = attach_jni_env();
@@ -338,8 +373,43 @@ impl MainThreadState {
             self.update_requested = false;
             self.event_handler.draw();
 
-            unsafe {
-                (self.libegl.eglSwapBuffers)(self.egl_display, self.surface);
+            let requested = crate::frame_pacing::requested();
+            if self.frame_pacing_applied != Some(requested) {
+                match requested {
+                    crate::FramePacing::Target(fps)
+                        if self.swappy_enabled && self.swappy_window_valid =>
+                    unsafe {
+                        (self.libegl.eglSwapInterval)(self.egl_display, 1);
+                        SwappyGL_setSwapIntervalNS(swap_interval_ns(fps));
+                    },
+                    crate::FramePacing::Unlimited => unsafe {
+                        (self.libegl.eglSwapInterval)(self.egl_display, 0);
+                    },
+                    crate::FramePacing::Target(_) => unsafe {
+                        // ponytail: native refresh fallback only; never restore the unstable timer.
+                        (self.libegl.eglSwapInterval)(self.egl_display, 1);
+                    },
+                }
+                self.frame_pacing_applied = Some(requested);
+            }
+
+            let swapped = match requested {
+                crate::FramePacing::Target(_)
+                    if self.swappy_enabled && self.swappy_window_valid =>
+                unsafe { SwappyGL_swap(self.egl_display, self.surface) },
+                _ => unsafe { (self.libegl.eglSwapBuffers)(self.egl_display, self.surface) != 0 },
+            };
+            if !swapped
+                && self.swappy_enabled
+                && self.swappy_window_valid
+                && matches!(requested, crate::FramePacing::Target(_))
+                && !self.swappy_swap_warning_logged
+            {
+                unsafe {
+                    console_warn(b"SwappyGL_swap failed; frame was not presented\0".as_ptr()
+                        as *const std::ffi::c_char);
+                }
+                self.swappy_swap_warning_logged = true;
             }
         }
         let mut display = crate::native_display().lock().unwrap();
@@ -498,34 +568,60 @@ where
     thread::spawn(move || {
         let mut libegl = LibEgl::try_load().expect("Cant load LibEGL");
 
-        // skip all the messages until android will be able to actually open a window
+        // Retain exactly the latest acquired native window until Android has
+        // also reported its size. A surface may be replaced or destroyed while
+        // startup is still waiting for SurfaceChanged.
         //
         // sometimes before launching an app android will show a permission dialog
         // it is important to create GL context only after a first SurfaceChanged
-        let window = 'a: loop {
-            match rx.try_recv() {
-                Ok(Message::SurfaceCreated { window }) => {
-                    break 'a window;
+        let mut window: *mut ndk_sys::ANativeWindow = std::ptr::null_mut();
+        let (screen_width, screen_height) = loop {
+            match rx.recv() {
+                Ok(Message::SurfaceCreated {
+                    window: next_window,
+                }) => {
+                    if !window.is_null() {
+                        ndk_sys::ANativeWindow_release(window);
+                    }
+                    window = next_window;
                 }
-                _ => {}
-            }
-        };
-        let (screen_width, screen_height) = 'a: loop {
-            match rx.try_recv() {
-                Ok(Message::SurfaceChanged { width, height }) => {
-                    break 'a (width as f32, height as f32);
+                Ok(Message::SurfaceDestroyed) => {
+                    if !window.is_null() {
+                        ndk_sys::ANativeWindow_release(window);
+                        window = std::ptr::null_mut();
+                    }
                 }
-                _ => {}
+                Ok(Message::SurfaceChanged { width, height }) if !window.is_null() => {
+                    break (width as f32, height as f32);
+                }
+                Ok(Message::Destroy) => {
+                    if !window.is_null() {
+                        ndk_sys::ANativeWindow_release(window);
+                    }
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if !window.is_null() {
+                        ndk_sys::ANativeWindow_release(window);
+                    }
+                    panic!("Android native message channel disconnected");
+                }
             }
         };
 
-        let (egl_context, egl_config, egl_display) = crate::native::egl::create_egl_context(
+        let (egl_context, egl_config, egl_display) = match crate::native::egl::create_egl_context(
             &mut libegl,
             std::ptr::null_mut(), /* EGL_DEFAULT_DISPLAY */
             conf.platform.framebuffer_alpha,
             conf.sample_count,
-        )
-        .expect("Cant create EGL context");
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                ndk_sys::ANativeWindow_release(window);
+                panic!("Cant create EGL context: {}", error);
+            }
+        };
 
         assert!(!egl_display.is_null());
         assert!(!egl_config.is_null());
@@ -542,9 +638,39 @@ where
             std::ptr::null_mut(),
         );
 
-        if (libegl.eglMakeCurrent)(egl_display, surface, surface, egl_context) == 0 {
-            panic!();
+        if surface.is_null() {
+            ndk_sys::ANativeWindow_release(window);
+            (libegl.eglDestroyContext)(egl_display, egl_context);
+            (libegl.eglTerminate)(egl_display);
+            panic!("Android EGL window surface creation failed");
         }
+
+        if (libegl.eglMakeCurrent)(egl_display, surface, surface, egl_context) == 0 {
+            (libegl.eglDestroySurface)(egl_display, surface);
+            ndk_sys::ANativeWindow_release(window);
+            (libegl.eglDestroyContext)(egl_display, egl_context);
+            (libegl.eglTerminate)(egl_display);
+            panic!("Android EGL window surface activation failed");
+        }
+
+        let env = attach_jni_env();
+        let swappy_initialized = SwappyGL_init(env, ACTIVITY);
+        let swappy_enabled = swappy_initialized && SwappyGL_isEnabled();
+        if swappy_enabled {
+            SwappyGL_setAutoSwapInterval(false);
+            SwappyGL_setAutoPipelineMode(false);
+        } else if swappy_initialized {
+            console_warn(
+                b"SwappyGL initialized but is not enabled; using EGL frame pacing\0".as_ptr()
+                    as *const std::ffi::c_char,
+            );
+        } else {
+            console_warn(
+                b"SwappyGL initialization failed; using EGL frame pacing\0".as_ptr()
+                    as *const std::ffi::c_char,
+            );
+        }
+        let swappy_window_valid = swappy_enabled && SwappyGL_setWindow(window);
 
         let clipboard = Box::new(AndroidClipboard::new());
         let tx_fn = Box::new(move |req| tx.send(Message::Request(req)).unwrap());
@@ -572,6 +698,12 @@ where
                 alt: false,
                 logo: false,
             },
+            swappy_enabled,
+            swappy_initialized,
+            swappy_window_valid,
+            frame_pacing_applied: None,
+            swappy_swap_warning_logged: false,
+            paused: false,
         };
 
         let rx_timeout = conf
@@ -580,6 +712,14 @@ where
             .map(|sleep| Duration::from_millis(sleep as u64));
 
         while !s.quit {
+            if s.paused || s.surface.is_null() {
+                match rx.recv() {
+                    Ok(message) => s.process_message(message),
+                    Err(_) => panic!("Android native message channel disconnected"),
+                }
+                continue;
+            }
+
             let block_on_wait = conf.platform.blocking_event_loop && !s.update_requested;
 
             if block_on_wait {
@@ -599,6 +739,10 @@ where
                 }
             }
 
+            if s.paused || s.surface.is_null() {
+                continue;
+            }
+
             if !conf.platform.blocking_event_loop || s.update_requested {
                 s.frame();
             }
@@ -606,13 +750,11 @@ where
             thread::yield_now();
         }
 
-        (s.libegl.eglMakeCurrent)(
-            s.egl_display,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        (s.libegl.eglDestroySurface)(s.egl_display, s.surface);
+        if s.swappy_initialized {
+            SwappyGL_destroy();
+            s.swappy_initialized = false;
+        }
+        s.destroy_surface();
         (s.libegl.eglDestroyContext)(s.egl_display, s.egl_context);
         (s.libegl.eglTerminate)(s.egl_display);
     });
@@ -693,6 +835,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceCreated(
 extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceDestroyed(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
+    _surface: ndk_sys::jobject,
 ) {
     send_message(Message::SurfaceDestroyed);
 }

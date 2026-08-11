@@ -66,12 +66,12 @@ pub fn take_ios_diagnostics() -> Vec<String> {
 }
 
 pub struct OpenedUrl {
-    url: *mut std::ffi::c_void,
+    url: *mut c_void,
     access_started: bool,
 }
 
 impl OpenedUrl {
-    pub fn as_ptr(&self) -> *mut std::ffi::c_void {
+    pub fn as_ptr(&self) -> *mut c_void {
         self.url
     }
 }
@@ -149,19 +149,16 @@ pub fn take_opened_urls() -> Vec<OpenedUrl> {
         .unwrap()
         .drain(..)
         .map(|(url, access_started)| OpenedUrl {
-            url: url as *mut std::ffi::c_void,
+            url: url as *mut c_void,
             access_started,
         })
         .collect()
 }
 
 struct MainThreadState {
-    quit: bool,
-    paused: bool,
-    update_requested: bool,
     view: *mut Object,
     keymods: KeyMods,
-    cur_msg: Message,
+    cur_msg: Option<Message>,
 }
 
 struct IosDisplay {
@@ -171,6 +168,7 @@ struct IosDisplay {
     textfield: ObjcId,
     ime_enabled: bool,
     gfx_api: conf::AppleGfxApi,
+    frame_pacing_applied: Option<crate::FramePacing>,
 
     event_handler: Option<Box<dyn EventHandler>>,
     _gles2: bool,
@@ -222,14 +220,13 @@ fn get_window_payload(this: &Object) -> &mut IosDisplay {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum Message {
     Resize { width: i32, height: i32 },
     Character { character: u32 },
     KeyDown { keycode: KeyCode },
     KeyUp { keycode: KeyCode },
-    ShowKeyboard(bool),
-    SetImeEnabled(bool),
+    Request(crate::native::Request),
     Wake,
     Pause,
     Resume,
@@ -241,30 +238,50 @@ thread_local! {
     static MESSAGES_TX: RefCell<Option<mpsc::Sender<Message>>> = const { RefCell::new(None) };
 }
 
-impl MainThreadState {
-    fn process_request(&mut self, request: crate::native::Request) -> Option<Message> {
-        use crate::native::Request::*;
-
-        match request {
-            ScheduleUpdate => {
-                self.update_requested = true;
-            }
-            ShowKeyboard(show) => return Some(Message::ShowKeyboard(show)),
-            SetImePosition { .. } => {
-                // IME position control not applicable on iOS
-            }
-            SetImeEnabled(enabled) => return Some(Message::SetImeEnabled(enabled)),
-            _ => {}
-        }
-        None
-    }
-}
-
 fn send_message(message: Message) {
     MESSAGES_TX.with(|tx| {
         let mut tx = tx.borrow_mut();
         tx.as_mut().unwrap().send(message).unwrap();
     })
+}
+
+unsafe fn requested_ios_fps(mode: crate::FramePacing) -> i32 {
+    match mode {
+        crate::FramePacing::Target(fps) => i32::from(fps.max(1)),
+        crate::FramePacing::Unlimited => {
+            let screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
+            msg_send![screen, maximumFramesPerSecond]
+        }
+    }
+}
+
+unsafe fn apply_frame_pacing(payload: &mut IosDisplay) {
+    let requested = crate::frame_pacing::requested();
+    if payload.frame_pacing_applied == Some(requested) {
+        return;
+    }
+    let fps = requested_ios_fps(requested).max(1);
+    match payload.gfx_api {
+        AppleGfxApi::OpenGl => {
+            msg_send_![payload.view_ctrl, setPreferredFramesPerSecond: fps];
+        }
+        AppleGfxApi::Metal => {
+            msg_send_![payload.view, setPreferredFramesPerSecond: fps];
+        }
+    }
+    payload.frame_pacing_applied = Some(requested);
+    eprintln!("[frame-pacing] iOS requested {requested:?}, preferred {fps}");
+}
+
+unsafe fn set_native_loop_paused(payload: &IosDisplay, paused: bool) {
+    match payload.gfx_api {
+        AppleGfxApi::OpenGl => {
+            msg_send_![payload.view_ctrl, setPaused: paused];
+        }
+        AppleGfxApi::Metal => {
+            msg_send_![payload.view, setPaused: paused];
+        }
+    }
 }
 
 pub(crate) fn touch_time_now() -> f64 {
@@ -282,9 +299,6 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
             let size: u64 = msg_send![touches, count];
             let enumerator: ObjcId = msg_send![touches, objectEnumerator];
             let payload = get_window_payload(this);
-            if payload.event_handler.is_none() {
-                payload.init_event_handler();
-            }
 
             for _ in 0..size {
                 let ios_touch: ObjcId = msg_send![enumerator, nextObject];
@@ -365,27 +379,43 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
 
     extern "C" fn process_message(this: &Object, _: Sel, _: ObjcId) {
         let payload = get_window_payload(this);
-        if payload.event_handler.is_none() {
-            payload.init_event_handler();
-        }
-        let msg = {
-            let state = payload.state.lock().unwrap();
-            state.cur_msg
-        };
+        let msg = payload.state.lock().unwrap().cur_msg.take().unwrap();
         match msg {
             Message::Pause => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = true;
+                unsafe { set_native_loop_paused(payload, true) };
             }
             Message::Resume => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = false;
+                payload.frame_pacing_applied = None;
+                unsafe {
+                    apply_frame_pacing(payload);
+                    set_native_loop_paused(payload, false);
+                }
             }
             Message::Destroy => {
-                let mut state = payload.state.lock().unwrap();
-                state.quit = true;
+                unsafe { set_native_loop_paused(payload, true) };
             }
             Message::Wake => {}
+            Message::Request(request) => {
+                use crate::native::Request::*;
+
+                match request {
+                    ShowKeyboard(show) => payload.show_keyboard(show),
+                    SetImeEnabled(enabled) => {
+                        payload.ime_enabled = enabled;
+                        if !enabled {
+                            payload.reset_textfield();
+                            window::push_ime_event(ImeEvent::End);
+                        }
+                    }
+                    ScheduleUpdate => {
+                        // Active native views already receive continuous display callbacks.
+                    }
+                    SetImePosition { .. } => {
+                        // IME position control is not applicable on iOS.
+                    }
+                    _ => {}
+                }
+            }
             Message::Character { character } => {
                 if let Some(character) = char::from_u32(character) {
                     if let Some(ref mut event_handler) = payload.event_handler {
@@ -417,14 +447,6 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                 }
                 if let Some(ref mut event_handler) = payload.event_handler {
                     event_handler.key_up_event(keycode, state.keymods);
-                }
-            }
-            Message::ShowKeyboard(show) => payload.show_keyboard(show),
-            Message::SetImeEnabled(enabled) => {
-                payload.ime_enabled = enabled;
-                if !enabled {
-                    payload.reset_textfield();
-                    window::push_ime_event(ImeEvent::End);
                 }
             }
             Message::Resize { width, height } => {
@@ -539,10 +561,11 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
             let mut display = native_display().lock().unwrap();
             display.pending_touch_starts.clear();
             display.pending_touch_events.clear();
-            drop(display);
-            let mut s = payload.state.lock().unwrap();
-            s.update_requested = false;
         }
+        // Apply policy changes published by this update before UIKit schedules
+        // the next display callback. GL-backed handler construction stays in
+        // this native draw callback, where GLK has made its context current.
+        unsafe { apply_frame_pacing(payload) };
     }
     // wrapper to make sel! macros happy
     extern "C" fn draw_in_rect2(this: &Object, s: Sel, o: ObjcId) {
@@ -604,7 +627,7 @@ unsafe fn create_opengl_view(screen_rect: NSRect, _sample_count: i32, high_dpi: 
     msg_send_![glk_view_obj, setContext: eagl_context_obj];
 
     msg_send_![glk_view_obj, setDelegate: glk_view_dlg_obj];
-    msg_send_![glk_view_obj, setEnableSetNeedsDisplay: YES];
+    msg_send_![glk_view_obj, setEnableSetNeedsDisplay: NO];
     msg_send_![glk_view_obj, setUserInteractionEnabled: YES];
     msg_send_![glk_view_obj, setMultipleTouchEnabled: YES];
     if high_dpi {
@@ -620,7 +643,8 @@ unsafe fn create_opengl_view(screen_rect: NSRect, _sample_count: i32, high_dpi: 
     let view_ctrl_obj: ObjcId = msg_send![view_ctrl_obj, init];
 
     msg_send_![view_ctrl_obj, setView: glk_view_obj];
-    msg_send_![view_ctrl_obj, setPreferredFramesPerSecond: 120];
+    msg_send_![view_ctrl_obj, setPreferredFramesPerSecond: 60];
+    msg_send_![view_ctrl_obj, setPaused: YES];
 
     View {
         view: glk_view_obj,
@@ -642,9 +666,9 @@ unsafe fn create_metal_view(screen_rect: NSRect, _sample_count: i32, _high_dpi: 
 
     msg_send_![view_ctrl_obj, setView: mtk_view_obj];
 
-    msg_send_![mtk_view_obj, setEnableSetNeedsDisplay: YES];
+    msg_send_![mtk_view_obj, setEnableSetNeedsDisplay: NO];
     msg_send_![mtk_view_obj, setPaused: YES];
-    msg_send_![mtk_view_obj, setPreferredFramesPerSecond:60];
+    msg_send_![mtk_view_obj, setPreferredFramesPerSecond: 60];
     msg_send_![mtk_view_obj, setDelegate: mtk_view_dlg_obj];
     let device = MTLCreateSystemDefaultDevice();
     msg_send_![mtk_view_obj, setDevice: device];
@@ -789,8 +813,8 @@ unsafe fn initialize_ios_display(window_obj: ObjcId, screen_rect: NSRect) -> boo
     let (textfield_dlg, textfield) = {
         let textfield_dlg = msg_send_![msg_send_![define_textfield_dlg(), alloc], init];
         let textfield = msg_send_![
-            msg_send_![class!(UITextField), alloc],
-            initWithFrame:NSRect::new(-100.0, -100.0, 1.0, 1.0)];
+                    msg_send_![class!(UITextField), alloc],
+                    initWithFrame:NSRect::new(-100.0, -100.0, 1.0, 1.0)];
         msg_send_![textfield, setAutocapitalizationType:0]; // UITextAutocapitalizationTypeNone
         msg_send_![textfield, setAutocorrectionType:1]; // UITextAutocorrectionTypeNo
         msg_send_![textfield, setSpellCheckingType:1]; // UITextSpellCheckingTypeNo
@@ -798,9 +822,9 @@ unsafe fn initialize_ios_display(window_obj: ObjcId, screen_rect: NSRect) -> boo
         // A hidden view cannot become first responder; keep this field off-screen instead.
         // UIControlEventEditingChanged reports both marked-text updates and commits.
         msg_send_![textfield, addTarget:textfield_dlg
-                   action:sel!(textFieldDidChange:)
-                   forControlEvents:1u64 << 17]; // UIControlEventEditingChanged
-                                                 // to make backspace work - with empty text there is no event on text removal
+                           action:sel!(textFieldDidChange:)
+                           forControlEvents:1u64 << 17]; // UIControlEventEditingChanged
+                                                         // to make backspace work - with empty text there is no event on text removal
         msg_send_![textfield, setText: apple_util::str_to_nsstring("x")];
         msg_send_![view.view, addSubview: textfield];
 
@@ -818,23 +842,28 @@ unsafe fn initialize_ios_display(window_obj: ObjcId, screen_rect: NSRect) -> boo
     };
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let native_requests_tx = tx.clone();
 
     MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx));
 
     let clipboard = Box::new(IosClipboard);
-    let (tx, requests_rx) = std::sync::mpsc::channel();
+    let native_requests = Box::new(move |request| {
+        native_requests_tx.send(Message::Request(request)).unwrap();
+    });
     crate::set_display(NativeDisplayData {
         high_dpi: conf.high_dpi,
         gfx_api: conf.platform.apple_gfx_api,
         blocking_event_loop: conf.platform.blocking_event_loop,
         view: view.view,
-        ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
+        ..NativeDisplayData::new(
+            conf.window_width,
+            conf.window_height,
+            native_requests,
+            clipboard,
+        )
     });
 
     let state_original = Arc::new(Mutex::new(MainThreadState {
-        quit: false,
-        paused: true,
-        update_requested: true,
         view: view.view,
         keymods: KeyMods {
             shift: false,
@@ -842,7 +871,7 @@ unsafe fn initialize_ios_display(window_obj: ObjcId, screen_rect: NSRect) -> boo
             alt: false,
             logo: false,
         },
-        cur_msg: Message::Resume,
+        cur_msg: None,
     }));
 
     let payload = Box::new(IosDisplay {
@@ -852,6 +881,7 @@ unsafe fn initialize_ios_display(window_obj: ObjcId, screen_rect: NSRect) -> boo
         ime_enabled: false,
         _textfield_dlg: textfield_dlg,
         gfx_api: conf.platform.apple_gfx_api,
+        frame_pacing_applied: None,
 
         f: Some(Box::new(f)),
         event_handler: None,
@@ -873,85 +903,20 @@ unsafe fn initialize_ios_display(window_obj: ObjcId, screen_rect: NSRect) -> boo
 
     let state = SendHack(state_original.clone());
     thread::spawn(move || {
-        let s = state.0;
-
-        loop {
-            while let Ok(request) = requests_rx.try_recv() {
-                let (view, message) = {
-                    let mut state = s.lock().unwrap();
-                    let message = state.process_request(request);
-                    if let Some(message) = message {
-                        state.cur_msg = message;
-                    }
-                    (state.view, message)
-                };
-                if message.is_some() {
-                    msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
-                }
-            }
-
-            let block_on_wait = {
-                let s = s.lock().unwrap();
-                (conf.platform.blocking_event_loop && !s.update_requested) || s.paused
+        let state = state.0;
+        while let Ok(message) = rx.recv() {
+            let destroying = matches!(message, Message::Destroy);
+            let view = {
+                let mut state = state.lock().unwrap();
+                state.cur_msg = Some(message);
+                state.view
             };
-
-            if block_on_wait {
-                let res = rx.recv();
-
-                if let Ok(msg) = res {
-                    let view;
-                    {
-                        let mut s = s.lock().unwrap();
-                        view = s.view;
-                        s.cur_msg = msg;
-                    }
-                    msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
-                }
-            } else {
-                // process all the messages from the main thread
-                while let Ok(msg) = rx.try_recv() {
-                    let view;
-                    {
-                        let mut s = s.lock().unwrap();
-                        view = s.view;
-                        s.cur_msg = msg;
-                    }
-                    msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
-                }
+            msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
+            if destroying {
+                break;
             }
-
-            let update_requested;
-            let view;
-            {
-                let s = s.lock().unwrap();
-                update_requested = s.update_requested;
-                view = s.view;
-            }
-
-            if !conf.platform.blocking_event_loop || update_requested {
-                match conf.platform.apple_gfx_api {
-                    AppleGfxApi::OpenGl => {
-                        // Why it differs from Metal? I don't realy know. Looks like a bug.
-                        // Somehow it needs `setNeedsDisplay` to redraw after touch.
-                        // With plain `display` it draws only after another touch.
-                        // But when it's not blocking_event_loop it makes fps really drop with `setNeedsDisplay`.
-                        // I hope it will work the same on the real device.
-                        if conf.platform.blocking_event_loop {
-                            msg_send_![&*view, performSelectorOnMainThread:sel!(setNeedsDisplay) withObject:nil waitUntilDone:NO];
-                        } else {
-                            msg_send_![&*view, performSelectorOnMainThread:sel!(display) withObject:nil waitUntilDone:YES];
-                        }
-                    }
-                    AppleGfxApi::Metal => {
-                        msg_send_![&*view, performSelectorOnMainThread:sel!(setNeedsDisplay) withObject:nil waitUntilDone:NO];
-                    }
-                }
-            }
-
-            thread::yield_now();
         }
     });
-
     true
 }
 
@@ -1002,7 +967,6 @@ pub fn define_scene_delegate() -> *const Class {
                 );
                 msg_send_![window_obj, release];
                 this.set_ivar("window", std::ptr::null_mut::<Object>());
-                return;
             }
         }
     }
@@ -1080,7 +1044,6 @@ pub fn define_app_delegate() -> *const Class {
             let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
 
             dispatch_opened_url(launch_url);
-
             initialize_ios_display(window_obj, screen_rect);
         }
         YES

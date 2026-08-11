@@ -132,6 +132,33 @@ mod wgl;
 
 use libopengl32::LibOpengl32;
 
+unsafe fn monitor_refresh_hz(wnd: HWND) -> Option<u32> {
+    let monitor = MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST);
+    if monitor.is_null() {
+        return None;
+    }
+    let mut info: MONITORINFOEXW = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO) == 0 {
+        return None;
+    }
+    let mut mode: DEVMODEW = std::mem::zeroed();
+    mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    if EnumDisplaySettingsW(info.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) == 0 {
+        return None;
+    }
+    (mode.dmDisplayFrequency > 1).then_some(mode.dmDisplayFrequency)
+}
+
+fn target_swap_interval(refresh_hz: u32, target_fps: u16) -> i32 {
+    let target = u32::from(target_fps.max(1));
+    refresh_hz
+        .saturating_add(target - 1)
+        .checked_div(target)
+        .unwrap_or(1)
+        .max(1) as i32
+}
+
 pub(crate) struct WindowsDisplay {
     fullscreen: bool,
     dpi_aware: bool,
@@ -147,6 +174,7 @@ pub(crate) struct WindowsDisplay {
     mouse_y: f32,
     cursor: HCURSOR,
     libopengl32: LibOpengl32,
+    wgl: Option<wgl::Wgl>,
     _msg_wnd: HWND,
     msg_dc: HDC,
     wnd: HWND,
@@ -154,6 +182,44 @@ pub(crate) struct WindowsDisplay {
     event_handler: Option<Box<dyn EventHandler>>,
     modal_resizing_timer: usize,
     update_requested: bool,
+    frame_pacing_applied: Option<crate::FramePacing>,
+    frame_pacing_dirty: bool,
+    frame_pacing_warning_logged: bool,
+}
+
+unsafe fn apply_frame_pacing(display: &mut WindowsDisplay) {
+    let requested = crate::frame_pacing::requested();
+    if display.frame_pacing_dirty || display.frame_pacing_applied != Some(requested) {
+        let selected = match requested {
+            crate::FramePacing::Unlimited => Some((0, None)),
+            crate::FramePacing::Target(fps) => monitor_refresh_hz(display.wnd).map(|refresh| {
+                let interval = target_swap_interval(refresh, fps);
+                (interval, Some(refresh as f64 / f64::from(interval)))
+            }),
+        };
+        if let Some((interval, effective)) = selected {
+            let applied = display
+                .wgl
+                .as_ref()
+                .map(|wgl| wgl.set_swap_interval(interval))
+                .unwrap_or(false);
+            if applied {
+                eprintln!(
+                    "[frame-pacing] Windows requested {requested:?}, effective {effective:?}"
+                );
+            } else if !display.frame_pacing_warning_logged {
+                eprintln!("[frame-pacing] WGL swap control unavailable or rejected");
+                display.frame_pacing_warning_logged = true;
+            }
+        } else if !display.frame_pacing_warning_logged {
+            eprintln!(
+                "[frame-pacing] Windows monitor refresh query failed; keeping driver default"
+            );
+            display.frame_pacing_warning_logged = true;
+        }
+        display.frame_pacing_applied = Some(requested);
+        display.frame_pacing_dirty = false;
+    }
 }
 
 impl WindowsDisplay {
@@ -556,8 +622,15 @@ unsafe extern "system" fn win32_wndproc(
             event_handler.mouse_motion_event(mouse_x, mouse_y);
         }
 
-        WM_MOVE if payload.cursor_grabbed => {
-            update_clip_rect(hwnd);
+        WM_MOVE => {
+            payload.frame_pacing_dirty = true;
+            if payload.cursor_grabbed {
+                update_clip_rect(hwnd);
+            }
+        }
+
+        WM_DISPLAYCHANGE => {
+            payload.frame_pacing_dirty = true;
         }
 
         WM_INPUT => {
@@ -762,11 +835,6 @@ unsafe extern "system" fn win32_wndproc(
         }
         WM_TIMER => {
             if wparam == &mut payload.modal_resizing_timer as *mut _ as usize {
-                payload.event_handler.as_mut().unwrap().update();
-                payload.event_handler.as_mut().unwrap().draw();
-
-                SwapBuffers(payload.dc);
-
                 if payload.update_dimensions(hwnd) {
                     let d = crate::native_display().lock().unwrap();
                     let width = d.screen_width as f32;
@@ -778,6 +846,12 @@ unsafe extern "system" fn win32_wndproc(
                         .unwrap()
                         .resize_event(width, height);
                 }
+
+                payload.event_handler.as_mut().unwrap().update();
+                payload.event_handler.as_mut().unwrap().draw();
+
+                apply_frame_pacing(payload);
+                SwapBuffers(payload.dc);
             }
         }
         WM_EXITSIZEMOVE | WM_EXITMENULOOP => {
@@ -1232,6 +1306,7 @@ where
             user_cursor: false,
             cursor: std::ptr::null_mut(),
             libopengl32,
+            wgl: None,
             _msg_wnd: msg_wnd,
             msg_dc,
             wnd,
@@ -1239,6 +1314,9 @@ where
             event_handler: None,
             modal_resizing_timer: 0,
             update_requested: true,
+            frame_pacing_applied: None,
+            frame_pacing_dirty: true,
+            frame_pacing_warning_logged: false,
         };
         display.init_dpi(conf.high_dpi);
 
@@ -1259,6 +1337,7 @@ where
             conf.sample_count,
             conf.platform.swap_interval.unwrap_or(1),
         );
+        display.wgl = Some(wgl);
 
         super::gl::load_gl_funcs(|proc| display.get_proc_address(proc));
 
@@ -1313,14 +1392,6 @@ where
                 }
             }
 
-            if !conf.platform.blocking_event_loop || display.update_requested {
-                display.update_requested = false;
-                display.event_handler.as_mut().unwrap().update();
-                display.event_handler.as_mut().unwrap().draw();
-
-                SwapBuffers(display.dc);
-            }
-
             if display.update_dimensions(wnd) {
                 let d = crate::native_display().lock().unwrap();
                 let width = d.screen_width as f32;
@@ -1331,6 +1402,14 @@ where
                     .as_mut()
                     .unwrap()
                     .resize_event(width, height);
+            }
+            if !conf.platform.blocking_event_loop || display.update_requested {
+                display.update_requested = false;
+                display.event_handler.as_mut().unwrap().update();
+                display.event_handler.as_mut().unwrap().draw();
+
+                apply_frame_pacing(&mut display);
+                SwapBuffers(display.dc);
             }
             if crate::native_display().lock().unwrap().quit_requested {
                 PostMessageW(display.wnd, WM_CLOSE, 0, 0);
