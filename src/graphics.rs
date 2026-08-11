@@ -823,7 +823,7 @@ pub struct BufferId(usize);
 /// Measurement is performed by calling [`ElapsedQuery::begin_query()`] and
 /// [`ElapsedQuery::end_query()`]
 ///
-/// ```
+/// ```no_run
 /// # use miniquad::graphics::ElapsedQuery;
 /// # let mut query = ElapsedQuery::new();
 ///
@@ -835,7 +835,7 @@ pub struct BufferId(usize);
 /// Retreival of measured duration is only possible at a later point in time. Often a frame or
 /// couple frames later. Measurement latency can especially be high on WASM/WebGL target.
 ///
-/// ```
+/// ```no_run
 /// // couple frames later:
 /// # use miniquad::graphics::ElapsedQuery;
 /// # let mut query = ElapsedQuery::new();
@@ -848,7 +848,7 @@ pub struct BufferId(usize);
 /// ```
 ///
 /// And during finalization:
-/// ```
+/// ```no_run
 /// // clean-up
 /// # use miniquad::graphics::ElapsedQuery;
 /// # let mut query = ElapsedQuery::new();
