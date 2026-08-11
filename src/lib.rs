@@ -9,6 +9,7 @@
 
 pub mod conf;
 mod event;
+mod frame_pacing;
 pub mod fs;
 pub mod graphics;
 pub mod native;
@@ -19,6 +20,8 @@ use std::ops::{Index, IndexMut};
 pub mod log;
 
 pub use event::*;
+
+pub use frame_pacing::{set_frame_pacing, FramePacing};
 
 pub use graphics::*;
 
@@ -297,12 +300,12 @@ pub mod window {
     /// TODO: implement window focus events
     pub fn set_cursor_grab(grab: bool) {
         let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             (d.native_requests)(native::Request::SetCursorGrab(grab));
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             d.native_requests
                 .send(native::Request::SetCursorGrab(grab))
@@ -316,13 +319,16 @@ pub mod window {
     ///
     /// Does nothing without `conf.platform.blocking_event_loop`.
     pub fn schedule_update() {
-        #[cfg(all(target_os = "android", not(target_arch = "wasm32")))]
+        #[cfg(all(
+            any(target_os = "android", target_os = "ios"),
+            not(target_arch = "wasm32")
+        ))]
         {
             let d = native_display().lock().unwrap();
             (d.native_requests)(native::Request::ScheduleUpdate);
         }
 
-        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
         {
             let d = native_display().lock().unwrap();
             d.native_requests
@@ -339,12 +345,12 @@ pub mod window {
     /// Show or hide the mouse cursor
     pub fn show_mouse(shown: bool) {
         let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             (d.native_requests)(native::Request::ShowMouse(shown));
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             d.native_requests
                 .send(native::Request::ShowMouse(shown))
@@ -355,12 +361,12 @@ pub mod window {
     /// Set the mouse cursor icon.
     pub fn set_mouse_cursor(cursor_icon: CursorIcon) {
         let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             (d.native_requests)(native::Request::SetMouseCursor(cursor_icon));
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             d.native_requests
                 .send(native::Request::SetMouseCursor(cursor_icon))
@@ -371,7 +377,7 @@ pub mod window {
     /// Set the application's window size.
     pub fn set_window_size(new_width: u32, new_height: u32) {
         let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             (d.native_requests)(native::Request::SetWindowSize {
                 new_width,
@@ -379,7 +385,7 @@ pub mod window {
             });
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             d.native_requests
                 .send(native::Request::SetWindowSize {
@@ -392,12 +398,12 @@ pub mod window {
 
     pub fn set_window_position(new_x: u32, new_y: u32) {
         let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             (d.native_requests)(native::Request::SetWindowPosition { new_x, new_y });
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             d.native_requests
                 .send(native::Request::SetWindowPosition { new_x, new_y })
@@ -415,12 +421,12 @@ pub mod window {
 
     pub fn set_fullscreen(fullscreen: bool) {
         let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             (d.native_requests)(native::Request::SetFullscreen(fullscreen));
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             d.native_requests
                 .send(native::Request::SetFullscreen(fullscreen))
@@ -456,12 +462,12 @@ pub mod window {
     /// Only works on Android right now.
     pub fn show_keyboard(show: bool) {
         let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             (d.native_requests)(native::Request::ShowKeyboard(show));
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             d.native_requests
                 .send(native::Request::ShowKeyboard(show))
@@ -479,7 +485,13 @@ pub mod window {
             let _ = (x, y); // IME position not applicable on Android
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        {
+            let d = native_display().lock().unwrap();
+            (d.native_requests)(native::Request::SetImePosition { x, y });
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let d = native_display().lock().unwrap();
             d.native_requests
@@ -497,12 +509,12 @@ pub mod window {
     /// * `enabled` - `true` to enable IME (for text input), `false` to disable (for game controls)
     pub fn set_ime_enabled(enabled: bool) {
         let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             (d.native_requests)(native::Request::SetImeEnabled(enabled));
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             d.native_requests
                 .send(native::Request::SetImeEnabled(enabled))

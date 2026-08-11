@@ -374,6 +374,15 @@ impl Wgl {
         pixel_format
     }
 
+    pub(crate) unsafe fn set_swap_interval(&self, interval: i32) -> bool {
+        if !self.ext_swap_control {
+            return false;
+        }
+        self.SwapIntervalEXT
+            .map(|set_interval| set_interval(interval))
+            .unwrap_or(false)
+    }
+
     pub(crate) unsafe fn create_context(
         &mut self,
         display: &mut WindowsDisplay,
@@ -459,10 +468,7 @@ impl Wgl {
             }
         }
         (display.libopengl32.wglMakeCurrent)(display.dc, gl_ctx);
-        if self.ext_swap_control {
-            /* FIXME: DwmIsCompositionEnabled() (see GLFW) */
-            (self.SwapIntervalEXT.unwrap())(swap_interval);
-        }
+        self.set_swap_interval(swap_interval);
 
         gl_ctx
     }

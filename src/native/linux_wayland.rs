@@ -1441,8 +1441,7 @@ where
             (libegl.eglGetProcAddress)(name.as_ptr() as _)
         });
 
-        display.decorations =
-            decorations::Decorations::new(&mut display, conf.platform.wayland_decorations);
+        display.decorations = decorations::Decorations::new(&mut display, conf);
         assert!(!display.xdg_toplevel.is_null());
 
         display.decorations.set_title(
@@ -1458,6 +1457,21 @@ where
             extensions::xdg_shell::xdg_toplevel::set_app_id,
             wm_class.as_ptr()
         );
+
+        if !conf.window_resizable {
+            for set_size in [
+                extensions::xdg_shell::xdg_toplevel::set_max_size,
+                extensions::xdg_shell::xdg_toplevel::set_min_size,
+            ] {
+                wl_request!(
+                    display.client,
+                    display.xdg_toplevel,
+                    set_size,
+                    conf.window_width,
+                    conf.window_height
+                );
+            }
+        }
 
         if conf.fullscreen {
             display.set_fullscreen(true);
