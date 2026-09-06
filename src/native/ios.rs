@@ -708,10 +708,6 @@ fn define_view_controller() -> *const Class {
         YES
     }
 
-    extern "C" fn supported_interface_orientations(_: &Object, _: Sel) -> u64 {
-        0x0000_0006
-    }
-
     unsafe {
         decl.add_method(
             sel!(prefersStatusBarHidden),
@@ -724,10 +720,6 @@ fn define_view_controller() -> *const Class {
         decl.add_method(
             sel!(shouldAutorotate),
             should_autorotate as extern "C" fn(&Object, Sel) -> BOOL,
-        );
-        decl.add_method(
-            sel!(supportedInterfaceOrientations),
-            supported_interface_orientations as extern "C" fn(&Object, Sel) -> u64,
         );
     }
 
@@ -750,10 +742,6 @@ fn define_glk_view_controller() -> *const Class {
         YES
     }
 
-    extern "C" fn supported_interface_orientations(_: &Object, _: Sel) -> u64 {
-        0x0000_0006
-    }
-
     extern "C" fn preferred_screen_edges_deferring_system_gestures(_: &Object, _: Sel) -> i32 {
         15
     }
@@ -770,10 +758,6 @@ fn define_glk_view_controller() -> *const Class {
         decl.add_method(
             sel!(shouldAutorotate),
             should_autorotate as extern "C" fn(&Object, Sel) -> BOOL,
-        );
-        decl.add_method(
-            sel!(supportedInterfaceOrientations),
-            supported_interface_orientations as extern "C" fn(&Object, Sel) -> u64,
         );
         decl.add_method(
             sel!(preferredScreenEdgesDeferringSystemGestures),
