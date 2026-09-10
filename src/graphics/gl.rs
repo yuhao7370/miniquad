@@ -72,6 +72,17 @@ struct Texture {
 }
 
 impl TextureFormat {
+    fn gl_texture_format(self, gles3: bool) -> (GLenum, GLenum, GLenum) {
+        let (internal_format, format, pixel_type) = self.into();
+        // ES3 depth textures require a sized internal format; ES2 uses OES_depth_texture.
+        let internal_format = if gles3 && self == TextureFormat::Depth {
+            GL_DEPTH_COMPONENT16
+        } else {
+            internal_format
+        };
+        (internal_format, format, pixel_type)
+    }
+
     fn sized_internal_format(&self) -> GLenum {
         match self {
             TextureFormat::RGB8 => GL_RGB8,
@@ -189,7 +200,9 @@ impl Texture {
                 "Multisampling is only supported for render textures"
             );
         }
-        let (internal_format, format, pixel_type) = params.format.into();
+        let (internal_format, format, pixel_type) = params
+            .format
+            .gl_texture_format(ctx.info.glsl_support.v300es);
 
         if access == TextureAccess::RenderTarget && params.sample_count > 1 {
             let mut renderbuffer: u32 = 0;
@@ -330,7 +343,10 @@ impl Texture {
         ctx.cache.store_texture_binding(0);
         ctx.cache.bind_texture(0, self.params.kind.into(), raw);
 
-        let (internal_format, format, pixel_type) = self.params.format.into();
+        let (internal_format, format, pixel_type) = self
+            .params
+            .format
+            .gl_texture_format(ctx.info.glsl_support.v300es);
 
         self.params.width = width;
         self.params.height = height;
@@ -463,6 +479,26 @@ impl Texture {
                 MipmapFilterMode::Linear => GL_LINEAR_MIPMAP_LINEAR,
             },
         }
+    }
+}
+
+#[test]
+fn es3_depth_texture_uses_sized_internal_format() {
+    assert_eq!(
+        TextureFormat::Depth.gl_texture_format(true),
+        (GL_DEPTH_COMPONENT16, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT)
+    );
+    assert_eq!(
+        TextureFormat::Depth.gl_texture_format(false),
+        (GL_DEPTH_COMPONENT, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT)
+    );
+    for format in [
+        TextureFormat::RGBA8,
+        TextureFormat::RGBA16F,
+        TextureFormat::Depth32,
+    ] {
+        assert_eq!(format.gl_texture_format(true), format.into());
+        assert_eq!(format.gl_texture_format(false), format.into());
     }
 }
 
