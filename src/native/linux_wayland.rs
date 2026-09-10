@@ -1398,6 +1398,7 @@ where
             wdisplay as *mut _,
             conf.platform.framebuffer_alpha,
             conf.sample_count,
+            2,
         )
         .unwrap();
 

@@ -34,6 +34,9 @@ pub const EGL_HEIGHT: u32 = 12374;
 pub const EGL_SURFACE_TYPE: u32 = 12339;
 pub const EGL_NONE: u32 = 12344;
 pub const EGL_CONTEXT_CLIENT_VERSION: u32 = 12440;
+pub const EGL_RENDERABLE_TYPE: u32 = 0x3040;
+pub const EGL_OPENGL_ES2_BIT: u32 = 0x0004;
+pub const EGL_OPENGL_ES3_BIT: u32 = 0x0040;
 
 pub type NativeDisplayType = EGLNativeDisplayType;
 pub type NativePixmapType = EGLNativePixmapType;
@@ -150,6 +153,7 @@ crate::declare_module! {
 pub enum EglError {
     NoDisplay,
     InitializeFailed,
+    NoMatchingConfig,
     CreateContextFailed,
 }
 
@@ -158,6 +162,9 @@ impl Display for EglError {
         match self {
             Self::NoDisplay => write!(f, "No display"),
             Self::InitializeFailed => write!(f, "Failed to initialize context"),
+            Self::NoMatchingConfig => {
+                write!(f, "No EGL config supports the requested OpenGL ES version")
+            }
             Self::CreateContextFailed => write!(f, "Faild to create context"),
         }
     }
@@ -172,6 +179,7 @@ pub unsafe fn create_egl_context(
     display: *mut std::ffi::c_void,
     alpha: bool,
     sample_count: i32,
+    gles_version: u32,
 ) -> Result<(EGLContext, EGLConfig, EGLDisplay), EglError> {
     let display = (egl.eglGetDisplay)(display as _);
     if display.is_null() {
@@ -187,6 +195,7 @@ pub unsafe fn create_egl_context(
     #[rustfmt::skip]
     let cfg_attributes = [
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, if gles_version == 3 { EGL_OPENGL_ES3_BIT } else { EGL_OPENGL_ES2_BIT },
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
@@ -199,14 +208,17 @@ pub unsafe fn create_egl_context(
     let mut available_cfgs: Vec<EGLConfig> = vec![null_mut(); 32];
     let mut cfg_count = 0;
 
-    (egl.eglChooseConfig)(
+    let chosen = (egl.eglChooseConfig)(
         display,
         cfg_attributes.as_ptr() as _,
         available_cfgs.as_ptr() as _,
         32,
         &mut cfg_count as *mut _ as *mut _,
     );
-    assert!(cfg_count > 0);
+    if chosen == 0 || cfg_count == 0 {
+        (egl.eglTerminate)(display);
+        return Err(EglError::NoMatchingConfig);
+    }
     assert!(cfg_count <= 32);
 
     // find config with 8-bit rgb buffer if available, ndk sample does not trust egl spec
@@ -237,7 +249,7 @@ pub unsafe fn create_egl_context(
     if !exact_cfg_found {
         config = available_cfgs[0];
     }
-    let ctx_attributes = [EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE];
+    let ctx_attributes = [EGL_CONTEXT_CLIENT_VERSION, gles_version, EGL_NONE];
     let context = (egl.eglCreateContext)(
         display,
         config,
@@ -245,6 +257,7 @@ pub unsafe fn create_egl_context(
         ctx_attributes.as_ptr() as _,
     );
     if context.is_null() {
+        (egl.eglTerminate)(display);
         return Err(EglError::CreateContextFailed);
     }
 

@@ -615,6 +615,7 @@ where
             std::ptr::null_mut(), /* EGL_DEFAULT_DISPLAY */
             conf.platform.framebuffer_alpha,
             conf.sample_count,
+            conf.platform.android_gles_version as u32,
         ) {
             Ok(context) => context,
             Err(error) => {

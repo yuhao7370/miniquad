@@ -101,6 +101,15 @@ pub enum WebGLVersion {
     WebGL2,
 }
 
+/// Android OpenGL ES context version. ES 3 requests never fall back to ES 2.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum AndroidGlesVersion {
+    #[default]
+    GLES2 = 2,
+    GLES3 = 3,
+}
+
 /// On Wayland, specify how to draw client-side decoration (CSD) if server-side decoration (SSD) is
 /// not supported (e.g., on GNOME).
 ///
@@ -128,6 +137,9 @@ pub struct Platform {
 
     /// Specifies which WebGL version to use on the Web (1.0. or 2.0).
     pub webgl_version: WebGLVersion,
+
+    /// OpenGL ES context requested on Android; defaults to ES 2.0.
+    pub android_gles_version: AndroidGlesVersion,
 
     /// Defines which rendering API to use on Apple platforms (Metal or OpenGL).
     pub apple_gfx_api: AppleGfxApi,
@@ -190,6 +202,7 @@ impl Default for Platform {
             linux_backend: LinuxBackend::default(),
             apple_gfx_api: AppleGfxApi::default(),
             webgl_version: WebGLVersion::default(),
+            android_gles_version: AndroidGlesVersion::default(),
             blocking_event_loop: false,
             sleep_interval_ms: None,
             swap_interval: None,
