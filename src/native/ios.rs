@@ -518,9 +518,6 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
 
     extern "C" fn draw_in_rect(this: &Object, _: Sel, _: ObjcId, _: ObjcId) {
         let payload = get_window_payload(this);
-        if payload.event_handler.is_none() {
-            payload.init_event_handler();
-        }
 
         let main_screen: ObjcId = unsafe { msg_send![class!(UIScreen), mainScreen] };
         let screen_rect: NSRect = unsafe { msg_send![main_screen, bounds] };
@@ -553,6 +550,12 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
                 width: screen_width,
                 height: screen_height,
             });
+        }
+
+        // The handler constructor reads window::screen_size(). Publish the real
+        // drawable dimensions first, rather than exposing the initial Conf size.
+        if payload.event_handler.is_none() {
+            payload.init_event_handler();
         }
 
         if let Some(ref mut event_handler) = payload.event_handler {
