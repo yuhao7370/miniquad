@@ -37,6 +37,7 @@ extern "C" {
     fn SwappyGL_setSwapIntervalNS(swap_ns: u64);
     fn SwappyGL_setAutoSwapInterval(enabled: bool);
     fn SwappyGL_setAutoPipelineMode(enabled: bool);
+    fn SwappyGL_resetFramePacing();
 }
 
 fn swap_interval_ns(fps: u16) -> u64 {
@@ -246,8 +247,21 @@ impl MainThreadState {
             panic!("Android EGL window surface activation failed");
         }
 
-        self.swappy_window_valid = self.swappy_enabled && SwappyGL_setWindow(self.window);
+        self.reset_frame_pacing();
+    }
+
+    unsafe fn reset_frame_pacing(&mut self) {
         self.frame_pacing_applied = None;
+        self.swappy_window_valid = false;
+        if self.swappy_enabled && !self.window.is_null() {
+            // Reset takes effect after swap. Rebind even a retained window so Swappy
+            // then reapplies the requested interval instead of keeping its reset default.
+            self.swappy_window_valid =
+                SwappyGL_setWindow(std::ptr::null_mut()) && SwappyGL_setWindow(self.window);
+            if self.swappy_window_valid {
+                SwappyGL_resetFramePacing();
+            }
+        }
     }
 
     fn process_message(&mut self, msg: Message) {
@@ -349,6 +363,8 @@ impl MainThreadState {
             }
             Message::Resume => {
                 self.paused = false;
+                // The display may have changed refresh rate while no frames were submitted.
+                unsafe { self.reset_frame_pacing() };
                 if self.fullscreen {
                     unsafe {
                         let env = attach_jni_env();

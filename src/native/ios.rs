@@ -385,11 +385,9 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                 unsafe { set_native_loop_paused(payload, true) };
             }
             Message::Resume => {
+                unsafe { set_native_loop_paused(payload, false) };
+                // Reapply in the first native draw, after UIKit has resumed its display loop.
                 payload.frame_pacing_applied = None;
-                unsafe {
-                    apply_frame_pacing(payload);
-                    set_native_loop_paused(payload, false);
-                }
             }
             Message::Destroy => {
                 unsafe { set_native_loop_paused(payload, true) };
@@ -643,6 +641,8 @@ unsafe fn create_opengl_view(screen_rect: NSRect, _sample_count: i32, high_dpi: 
     let view_ctrl_obj: ObjcId = msg_send![view_ctrl_obj, init];
 
     msg_send_![view_ctrl_obj, setView: glk_view_obj];
+    // Keep GLK's synchronous background pause; Miniquad owns resume and pacing.
+    msg_send_![view_ctrl_obj, setResumeOnDidBecomeActive: NO];
     msg_send_![view_ctrl_obj, setPreferredFramesPerSecond: 60];
     msg_send_![view_ctrl_obj, setPaused: YES];
 
