@@ -383,8 +383,21 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         match msg {
             Message::Pause => {
                 unsafe { set_native_loop_paused(payload, true) };
+                if let Some(handler) = payload.event_handler.as_mut() {
+                    handler.window_minimized_event();
+                }
             }
             Message::Resume => {
+                {
+                    let mut display = native_display().lock().unwrap();
+                    display.pending_touch_events.clear();
+                    display.pending_touch_starts.clear();
+                    display.touch_start_times.clear();
+                }
+                payload.state.lock().unwrap().keymods = KeyMods::default();
+                if let Some(handler) = payload.event_handler.as_mut() {
+                    handler.window_restored_event();
+                }
                 unsafe { set_native_loop_paused(payload, false) };
                 // Reapply in the first native draw, after UIKit has resumed its display loop.
                 payload.frame_pacing_applied = None;

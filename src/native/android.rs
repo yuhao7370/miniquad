@@ -363,6 +363,13 @@ impl MainThreadState {
             }
             Message::Resume => {
                 self.paused = false;
+                self.keymods = KeyMods::default();
+                {
+                    let mut display = crate::native_display().lock().unwrap();
+                    display.pending_touch_events.clear();
+                    display.pending_touch_starts.clear();
+                    display.touch_start_times.clear();
+                }
                 // The display may have changed refresh rate while no frames were submitted.
                 unsafe { self.reset_frame_pacing() };
                 if self.fullscreen {
