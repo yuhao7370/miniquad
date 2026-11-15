@@ -172,6 +172,7 @@ pub(crate) struct WindowsDisplay {
     user_cursor: bool,
     mouse_x: f32,
     mouse_y: f32,
+    mouse_buttons_down: [bool; 3],
     cursor: HCURSOR,
     libopengl32: LibOpengl32,
     wgl: Option<wgl::Wgl>,
@@ -495,6 +496,40 @@ unsafe extern "system" fn win32_wndproc(
     if display_ptr == 0 {
         return DefWindowProcW(hwnd, umsg, wparam, lparam);
     }
+
+    let button_event = match umsg {
+        WM_LBUTTONDOWN => Some((MouseButton::Left, true)),
+        WM_RBUTTONDOWN => Some((MouseButton::Right, true)),
+        WM_MBUTTONDOWN => Some((MouseButton::Middle, true)),
+        WM_LBUTTONUP => Some((MouseButton::Left, false)),
+        WM_RBUTTONUP => Some((MouseButton::Right, false)),
+        WM_MBUTTONUP => Some((MouseButton::Middle, false)),
+        _ => None,
+    };
+    if let Some((button, down)) = button_event {
+        // Capture routes motion and button-up back here even outside the window.
+        // Changing capture can re-enter a window procedure; take the borrow afterwards.
+        if down && GetCapture() != hwnd {
+            SetCapture(hwnd);
+        }
+        let display = &mut *(display_ptr as *mut WindowsDisplay);
+        let x = GET_X_LPARAM(lparam) as f32 * display.mouse_scale;
+        let y = GET_Y_LPARAM(lparam) as f32 * display.mouse_scale;
+        display.mouse_x = x;
+        display.mouse_y = y;
+        let was_down = std::mem::replace(&mut display.mouse_buttons_down[button as usize], down);
+        let handler = display.event_handler.as_mut().unwrap();
+        if down {
+            handler.mouse_button_down_event(button, x, y);
+        } else if was_down {
+            handler.mouse_button_up_event(button, x, y);
+            if display.mouse_buttons_down == [false; 3] && GetCapture() == hwnd {
+                ReleaseCapture();
+            }
+        }
+        return DefWindowProcW(hwnd, umsg, wparam, lparam);
+    }
+
     let payload = &mut *(display_ptr as *mut WindowsDisplay);
     let event_handler = payload.event_handler.as_mut().unwrap();
 
@@ -561,40 +596,16 @@ unsafe extern "system" fn win32_wndproc(
                 return 1;
             }
         }
-        WM_LBUTTONDOWN => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
-            event_handler.mouse_button_down_event(MouseButton::Left, mouse_x, mouse_y);
-        }
-        WM_RBUTTONDOWN => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
-
-            event_handler.mouse_button_down_event(MouseButton::Right, mouse_x, mouse_y);
-        }
-        WM_MBUTTONDOWN => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
-
-            event_handler.mouse_button_down_event(MouseButton::Middle, mouse_x, mouse_y);
-        }
-        WM_LBUTTONUP => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
-
-            event_handler.mouse_button_up_event(MouseButton::Left, mouse_x, mouse_y);
-        }
-        WM_RBUTTONUP => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
-
-            event_handler.mouse_button_up_event(MouseButton::Right, mouse_x, mouse_y);
-        }
-        WM_MBUTTONUP => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
-
-            event_handler.mouse_button_up_event(MouseButton::Middle, mouse_x, mouse_y);
+        WM_CAPTURECHANGED => {
+            // On a normal last-button release this is already empty. If capture
+            // was taken away, finish only the presses still owned by this window.
+            let held = std::mem::take(&mut payload.mouse_buttons_down);
+            for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+                if held[button as usize] {
+                    event_handler.mouse_button_up_event(button, payload.mouse_x, payload.mouse_y);
+                }
+            }
+            return 0;
         }
 
         WM_MOUSEMOVE => {
@@ -884,6 +895,9 @@ unsafe extern "system" fn win32_wndproc(
                 event_handler.window_restored_event();
             } else {
                 event_handler.window_minimized_event();
+                if payload.mouse_buttons_down != [false; 3] && GetCapture() == hwnd {
+                    ReleaseCapture();
+                }
             }
         }
         WM_SETFOCUS => {
@@ -1302,6 +1316,7 @@ where
             window_scale: 1.,
             mouse_x: 0.,
             mouse_y: 0.,
+            mouse_buttons_down: [false; 3],
             show_cursor: true,
             user_cursor: false,
             cursor: std::ptr::null_mut(),
