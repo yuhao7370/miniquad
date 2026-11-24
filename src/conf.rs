@@ -120,6 +120,12 @@ pub enum WaylandDecorations {
 /// Platform-specific settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Platform {
+    /// On Windows, Linux and macOS, render into a private single-sample OpenGL
+    /// framebuffer without presenting a window or receiving desktop input.
+    /// Its pixel dimensions follow the requested window size. Applications can
+    /// still create multisampled render passes. Ignored on mobile and web.
+    pub offscreen: bool,
+
     /// Determines how to load an OpenGL context on X11 (via GLX or EGL).
     pub linux_x11_gl: LinuxX11Gl,
 
@@ -186,6 +192,7 @@ pub struct Platform {
 impl Default for Platform {
     fn default() -> Platform {
         Platform {
+            offscreen: false,
             linux_x11_gl: LinuxX11Gl::default(),
             linux_backend: LinuxBackend::default(),
             apple_gfx_api: AppleGfxApi::default(),

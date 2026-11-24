@@ -1113,7 +1113,7 @@ unsafe fn create_msg_window() -> (HWND, HDC) {
     let class_name = "MINIQUADMSGWND\0".encode_utf16().collect::<Vec<u16>>();
 
     let mut wndclassw: WNDCLASSW = std::mem::zeroed();
-    wndclassw.style = 0;
+    wndclassw.style = CS_OWNDC;
     wndclassw.lpfnWndProc = Some(DefWindowProcW);
     wndclassw.hInstance = GetModuleHandleW(NULL as _);
     wndclassw.lpszClassName = class_name.as_ptr() as _;
@@ -1144,7 +1144,6 @@ unsafe fn create_msg_window() -> (HWND, HDC) {
     // Disable IME for message window to avoid interfering with main window
     ImmAssociateContextEx(msg_hwnd, std::ptr::null_mut(), IACE_CHILDREN);
 
-    ShowWindow(msg_hwnd, SW_HIDE);
     let mut msg = std::mem::zeroed();
     while PeekMessageW(&mut msg as _, msg_hwnd, 0, 0, PM_REMOVE) != 0 {
         TranslateMessage(&msg);
@@ -1288,19 +1287,27 @@ where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
     unsafe {
-        if conf.high_dpi {
-            SetProcessDPIAware();
-        }
-        let (wnd, dc) = create_window(
-            &conf.window_title,
-            conf.fullscreen,
-            conf.window_resizable,
-            conf.window_width as _,
-            conf.window_height as _,
-        );
-        if let Some(icon) = &conf.icon {
-            set_icon(wnd, icon);
-        }
+        // WGL needs a device context. Both offscreen helper windows are
+        // created without WS_VISIBLE and use DefWindowProc, so they never
+        // activate or forward desktop input to the application.
+        let (wnd, dc) = if conf.platform.offscreen {
+            create_msg_window()
+        } else {
+            if conf.high_dpi {
+                SetProcessDPIAware();
+            }
+            let (wnd, dc) = create_window(
+                &conf.window_title,
+                conf.fullscreen,
+                conf.window_resizable,
+                conf.window_width,
+                conf.window_height,
+            );
+            if let Some(icon) = &conf.icon {
+                set_icon(wnd, icon);
+            }
+            (wnd, dc)
+        };
 
         let libopengl32 = LibOpengl32::try_load().expect("Failed to load opengl32.dll.");
 
@@ -1333,18 +1340,21 @@ where
             frame_pacing_dirty: true,
             frame_pacing_warning_logged: false,
         };
-        display.init_dpi(conf.high_dpi);
+        let window_requests = (!conf.platform.offscreen).then(|| {
+            display.init_dpi(conf.high_dpi);
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let clipboard = Box::new(clipboard::WindowsClipboard::new());
-        crate::set_display(NativeDisplayData {
-            high_dpi: conf.high_dpi,
-            dpi_scale: display.window_scale,
-            blocking_event_loop: conf.platform.blocking_event_loop,
-            ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
+            let (tx, rx) = std::sync::mpsc::channel();
+            let clipboard = Box::new(clipboard::WindowsClipboard::new());
+            crate::set_display(NativeDisplayData {
+                high_dpi: conf.high_dpi,
+                dpi_scale: display.window_scale,
+                blocking_event_loop: conf.platform.blocking_event_loop,
+                ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
+            });
+
+            display.update_dimensions(wnd);
+            rx
         });
-
-        display.update_dimensions(wnd);
 
         let mut wgl = wgl::Wgl::new(&mut display);
         let gl_ctx = wgl.create_context(
@@ -1356,6 +1366,17 @@ where
 
         super::gl::load_gl_funcs(|proc| display.get_proc_address(proc));
 
+        if conf.platform.offscreen {
+            super::offscreen::run(conf, f);
+            (display.libopengl32.wglMakeCurrent)(std::ptr::null_mut(), std::ptr::null_mut());
+            (display.libopengl32.wglDeleteContext)(gl_ctx);
+            ReleaseDC(wnd, dc);
+            ReleaseDC(msg_wnd, msg_dc);
+            DestroyWindow(wnd);
+            DestroyWindow(msg_wnd);
+            return;
+        }
+        let rx = window_requests.unwrap();
         // IMPORTANT: Show window AFTER WGL context is created
         // This ensures IME initializes correctly when window gains focus
         ShowWindow(wnd, SW_SHOW);

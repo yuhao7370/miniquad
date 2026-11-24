@@ -146,6 +146,14 @@ crate::declare_module! {
     ...
 }
 
+#[cfg(target_os = "linux")]
+impl LibEgl {
+    // Resolve optional platform entry points without requiring them in the windowed backend.
+    pub(super) fn module(&self) -> &crate::native::module::Module {
+        &self._module
+    }
+}
+
 #[derive(Debug)]
 pub enum EglError {
     NoDisplay,

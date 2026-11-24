@@ -30,6 +30,7 @@ pub const GL_INT_2_10_10_10_REV: u32 = 0x8D9F;
 pub const GL_PROGRAM_POINT_SIZE: u32 = 0x8642;
 pub const GL_STENCIL_ATTACHMENT: u32 = 0x8D20;
 pub const GL_DEPTH_ATTACHMENT: u32 = 0x8D00;
+pub const GL_DEPTH24_STENCIL8: u32 = 0x88F0;
 pub const GL_COLOR_ATTACHMENT2: u32 = 0x8CE2;
 pub const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
 pub const GL_COLOR_ATTACHMENT22: u32 = 0x8CF6;
@@ -304,6 +305,11 @@ pub const ERROR_INVALID_VERSION_ARB: u32 = 0x2095;
 pub const ERROR_INVALID_PROFILE_ARB: u32 = 0x2096;
 pub const ERROR_INCOMPATIBLE_DEVICE_CONTEXTS_ARB: u32 = 0x2054;
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+extern "C" fn clear_depth_f32(depth: GLfloat) {
+    unsafe { glClearDepth(f64::from(depth)) };
+}
+
 macro_rules! gl_loader {
     (
         $(
@@ -332,6 +338,13 @@ macro_rules! gl_loader {
                     __pfns::$fn = ::std::mem::transmute_copy(&getprocaddr(fn_name));
                 }
             )*
+            // Desktop GL before 4.1 guarantees the double-precision entry point.
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+            unsafe {
+                if let (None, Some(_)) = (__pfns::glClearDepthf, __pfns::glClearDepth) {
+                    __pfns::glClearDepthf = Some(clear_depth_f32);
+                }
+            }
         }
     };
 }

@@ -562,6 +562,9 @@ where
 {
     #[cfg(target_os = "linux")]
     {
+        if conf.platform.offscreen {
+            return native::linux_offscreen::run(conf, f);
+        }
         let mut f = Some(f);
         let f = &mut f;
         match conf.platform.linux_backend {
@@ -604,6 +607,9 @@ where
 
     #[cfg(target_os = "macos")]
     unsafe {
+        if conf.platform.offscreen {
+            return native::macos_offscreen::run(conf, f);
+        }
         native::macos::run(conf, f);
     }
 
