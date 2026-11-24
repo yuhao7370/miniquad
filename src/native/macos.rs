@@ -522,7 +522,7 @@ pub fn define_cocoa_window_delegate() -> *const Class {
     decl.register()
 }
 
-unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
+pub(super) unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
     mod libc {
         use std::ffi::{c_char, c_int, c_void};
 
